@@ -114,6 +114,7 @@ def create_xci(title_id, paths):
         if path.parent == updates:
             number_of_updates += 1
             name = path.stem
+            name = re.sub(title_id + r'([a-zA-Z0-9])(800])', title_id + r'\g<1>000]', name)
         if path.parent == dlc:
             number_of_dlc += 1
 
