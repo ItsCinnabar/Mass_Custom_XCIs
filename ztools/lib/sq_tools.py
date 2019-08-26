@@ -9,36 +9,56 @@ from struct import pack as pk, unpack as upk
 import Fs
 import aes128
 import sq_tools
+import io
 indent = 1
 tabs = '\t' * indent	
 '''	
 versions = 
-      0:       "1.0.0",   ->   keygeneration = 0
+    0:         "1.0.0",   ->   keygeneration = 0
     450:       "1.0.0",   ->   keygeneration = 0
-    65796:     "2.0.0",   ->   keygeneration = 1
-    131162:    "2.1.0",   ->   keygeneration = 1
-    196628:    "2.2.0",   ->   keygeneration = 1
-    262164:    "2.3.0",   ->   keygeneration = 1
-    201327002: "3.0.0",   ->   keygeneration = 2
-    201392178: "3.0.1",   ->   keygeneration = 3
-    201457684: "3.0.2",   ->   keygeneration = 3
-    268435656: "4.0.0",   ->   keygeneration = 4
-    268501002: "4.0.1",   ->   keygeneration = 4
-    269484082: "4.1.0",   ->   keygeneration = 4
-    335544750: "5.0.0",   ->   keygeneration = 5
-    335609886: "5.0.1",   ->   keygeneration = 5
-    335675432: "5.0.2",   ->   keygeneration = 5
-    336592976: "5.1.0",   ->   keygeneration = 5
-    402653494: "6.0.0-4", ->   keygeneration = 6 
-    402653514: "6.0.0",   ->   keygeneration = 6
-    402653544: "6.0.0",   ->   keygeneration = 6
-    402718730: "6.0.1",   ->   keygeneration = 6
-    403701850: "6.1.0",   ->   keygeneration = 6
+    65536:     "2.0.0",   ->   keygeneration = 1
+    131072:    "2.1.0",   ->   keygeneration = 1
+    196608:    "2.2.0",   ->   keygeneration = 1
+    262144:    "2.3.0",   ->   keygeneration = 1
+    201326592: "3.0.0",   ->   keygeneration = 2
+    201392128: "3.0.1",   ->   keygeneration = 3
+    201457664: "3.0.2",   ->   keygeneration = 3
+    268435456: "4.0.0",   ->   keygeneration = 4
+    268500992: "4.0.1",   ->   keygeneration = 4
+    269484032: "4.1.0",   ->   keygeneration = 4
+    335544320: "5.0.0",   ->   keygeneration = 5
+    335609856: "5.0.1",   ->   keygeneration = 5
+    335675392: "5.0.2",   ->   keygeneration = 5
+    336592896: "5.1.0",   ->   keygeneration = 5
+    402653184: "6.0.0",   ->   keygeneration = 6
+    402718720: "6.0.1",   ->   keygeneration = 6
+    403701760: "6.1.0",   ->   keygeneration = 6
 	404750336: "6.2.0"    ->   keygeneration = 7
-    404750376: "6.2.0-40" ->   keygeneration = 7
 	469762048: "7.0.0"    ->   keygeneration = 8
 	469827584: "7.0.1"    ->   keygeneration = 8  
+	536870912: "8.0.0"    ->   keygeneration = 8
+	536936448: "8.0.1"    ->   keygeneration = 8	
+	537919488: "8.1.0"    ->   keygeneration = 9		
 '''	
+def kgstring(kg=list()):
+	kg=list()
+	kg9=[537919488];kg.append(kg9)		
+	kg8=[536936448,536870912,469827584,469762048];kg.append(kg8)	
+	kg7=[404750336];kg.append(kg7)	
+	kg6=[403701760,402718720,402653184];kg.append(kg6)	
+	kg5=[336592896,335675392,335609856,335544320];kg.append(kg5)	
+	kg4=[269484032,268500992,268435456];kg.append(kg4)	
+	kg3=[201457664,201392128];kg.append(kg3)	
+	kg2=[201326592];kg.append(kg2)	
+	kg1=[262144,196608,131072,65536];kg.append(kg1)	
+	kg0=[450,0];kg.append(kg0)
+	return kg
+	
+def kg2masterkey(kg):
+	if kg == 1:
+		return 1
+	else:
+		return kg-1
 
 def getTopRSV(keygeneration, RSV):
 	if keygeneration == 0:
@@ -58,7 +78,9 @@ def getTopRSV(keygeneration, RSV):
 	if keygeneration == 7:
 		return 404750376
 	if keygeneration == 8:
-		return 469827584		
+		return 536936448
+	if keygeneration == 9:
+		return 537919488		
 	else:
 		return RSV
 
@@ -88,6 +110,9 @@ def getMinRSV(keygeneration, RSV):
 	if keygeneration == 8:
 		RSV=7*67108864
 		return RSV	
+	if keygeneration == 9:
+		RSV=8*67108864+1*1048576
+		return RSV			
 	else:
 		return RSV		
 		
@@ -109,7 +134,9 @@ def getFWRangeKG(keygeneration):
 	if keygeneration == 7:
 		return "(6.2.0)"
 	if keygeneration == 8:
-		return "(7.0.0 - >7.0.1)"		
+		return "(7.0.0 - 8.0.1)"	
+	if keygeneration == 9:
+		return "(8.1.0 - >8.1.0)"			
 	else:
 		return "UNKNOWN"			
 	
@@ -382,6 +409,10 @@ def verify_nkeys(fileName):
 		print("master_key_07 is Missing")
 	else:
 		counter+=1
+	if 'master_key_08' not in checkkeys:
+		print("master_key_08 is Missing")
+	else:
+		counter+=1		
 		
 	if 'header_key' not in checkkeys:
 		print("header_key is Missing")	
@@ -557,7 +588,18 @@ def verify_nkeys(fileName):
 				print(tabs+'> Key is valid!!!')
 			else:
 				print(tabs+'> Key is invalid!!! -> PLEASE CHECK YOUR KEYS.TXT!!!')			
-			print('')		
+			print('')	
+
+		if i == 'master_key_08':
+			master_key_08=checkkeys[i][:]
+			print('master_key_08: '+master_key_08)
+			sha=sha256(uhx(master_key_08)).hexdigest()
+			print('  > HEX SHA256: '+sha)	
+			if sha == '2998e2e23609bc2675ff062a2d64af5b1b78dff463b24119d64a1b64f01b2d51':
+				print(tabs+'> Key is valid!!!')
+			else:
+				print(tabs+'> Key is invalid!!! -> PLEASE CHECK YOUR KEYS.TXT!!!')			
+			print('')				
 
 		if i == 'header_key':
 			header_key=checkkeys[i][:]
@@ -664,6 +706,16 @@ def verify_nkeys_startup(fileName):
 		print("master_key_06 is Missing!!!")
 		print("The program won't be able to decrypt games content that uses this key")
 		print("This key represents FW 6.2.0 requirement")
+		startup=True		
+	if 'master_key_07' not in checkkeys:
+		print("master_key_07 is Missing!!!")
+		print("The program won't be able to decrypt games content that uses this key")
+		print("This key represents FW 7.0.0-8.0.1 requirement")
+		startup=True	
+	if 'master_key_08' not in checkkeys:
+		print("master_key_08 is Missing!!!")
+		print("The program won't be able to decrypt games content that uses this key")
+		print("This key represents FW 8.1 requirement")
 		startup=True			
 	else:
 		counter+=1
@@ -671,16 +723,7 @@ def verify_nkeys_startup(fileName):
 	if 'header_key' not in checkkeys:
 		print("header_key is Missing")	
 	if 'xci_header_key' not in checkkeys:	
-		print('OPTIONAL KEY "xci_header_key" is Missing')
-		
-	if 	startup==True:		
-		if 'master_key_07' not in checkkeys:
-			print("master_key_07 is Missing!!!")
-			print("The program won't be able to decrypt games content that uses this key")
-			print("This key represents FW 7.0.0-7.0.1 requirement")	
-			print("This key is not yet public")			
-		else:
-			counter+=1		
+		print('OPTIONAL KEY "xci_header_key" is Missing')	
 
 	while counter<len(checkkeys):
 		if len(str(counter))<2:
@@ -835,6 +878,16 @@ def verify_nkeys_startup(fileName):
 			master_key_07=checkkeys[i][:]
 			sha=sha256(uhx(master_key_07)).hexdigest()
 			if sha != '4ec96b8cb01b8dce382149443430b2b6ebcb2983348afa04a25e53609dabedf6':
+				print('master_key_07: '+aes_kek_generation_source )	
+				print('  > HEX SHA256: '+sha)
+				print(tabs+'> Key is invalid!!! -> PLEASE CHECK YOUR KEYS.TXT!!!')		
+				startup=True				
+			print('')	
+
+		if i == 'master_key_08':
+			master_key_08=checkkeys[i][:]
+			sha=sha256(uhx(master_key_08)).hexdigest()
+			if sha != '2998e2e23609bc2675ff062a2d64af5b1b78dff463b24119d64a1b64f01b2d51':
 				print('master_key_07: '+aes_kek_generation_source )	
 				print('  > HEX SHA256: '+sha)
 				print(tabs+'> Key is invalid!!! -> PLEASE CHECK YOUR KEYS.TXT!!!')		
@@ -1037,4 +1090,113 @@ def get_xciheader(oflist,osizelist,sec_hashlist):
 
 	return header,enc_info,sig_padding,fake_CERT,root_header,upd_header,norm_header,sec_header,rootSize,upd_multiplier,norm_multiplier,sec_multiplier
 
+def ret_nsp_offsets(filepath):
+	files_list=list()
+	try:
+		with open(filepath, 'r+b') as f:			
+			data=f.read(int(8*1024))						
+		try:
+			head=data[0:4]
+			n_files=(data[4:8])
+			n_files=int.from_bytes(n_files, byteorder='little')		
+			st_size=(data[8:12])
+			st_size=int.from_bytes(st_size, byteorder='little')		
+			junk=(data[12:16])
+			offset=(0x10 + n_files * 0x18)
+			stringTable=(data[offset:offset+st_size])
+			stringEndOffset = st_size
+			headerSize = 0x10 + 0x18 * n_files + st_size
+			#print(head)
+			#print(str(n_files))
+			#print(str(st_size))	
+			#print(str((stringTable)))		
+			for i in range(n_files):
+				i = n_files - i - 1
+				pos=0x10 + i * 0x18
+				offset = data[pos:pos+8]
+				offset=int.from_bytes(offset, byteorder='little')			
+				size = data[pos+8:pos+16]
+				size=int.from_bytes(size, byteorder='little')			
+				nameOffset = data[pos+16:pos+20] # just the offset
+				nameOffset=int.from_bytes(nameOffset, byteorder='little')			
+				name = stringTable[nameOffset:stringEndOffset].decode('utf-8').rstrip(' \t\r\n\0')
+				stringEndOffset = nameOffset
+				junk2 = data[pos+20:pos+24] # junk data
+				#print(name)
+				#print(offset)	
+				#print(size)	
+				off1=offset+headerSize
+				off2=off1+size
+				files_list.append([name,off1,off2,size])	
+			files_list.reverse()	
+			#print(files_list)
+		except BaseException as e:
+			Print.error('Exception: ' + str(e))
+		#print(files_list)	
+	except BaseException as e:
+		Print.error('Exception: ' + str(e))
+	return	files_list
 
+def ret_xci_offsets(filepath):
+	files_list=list()
+	try:		
+		with open(filepath, 'r+b') as f:
+			rawhead = io.BytesIO(f.read(int(0x200)))
+			data=rawhead.read()
+			#print(hx(data))
+		try:			
+			rawhead.seek(0x100)
+			magic=rawhead.read(0x4)
+			if magic==b'HEAD':
+				#print(magic)
+				secureOffset=int.from_bytes(rawhead.read(4), byteorder='little')
+				secureOffset=secureOffset*0x200
+				with open(filepath, 'r+b') as f:	
+					f.seek(secureOffset)
+					data=f.read(int(8*1024))
+					rawhead = io.BytesIO(data)
+				rmagic=rawhead.read(0x4)
+				if rmagic==b'HFS0':
+					#print(rmagic)
+					head=data[0:4]
+					n_files=(data[4:8])
+					n_files=int.from_bytes(n_files, byteorder='little')		
+					st_size=(data[8:12])
+					st_size=int.from_bytes(st_size, byteorder='little')		
+					junk=(data[12:16])
+					offset=(0x10 + n_files * 0x40)
+					stringTable=(data[offset:offset+st_size])
+					stringEndOffset = st_size
+					headerSize = 0x10 + 0x40 * n_files + st_size
+					#print(head)
+					#print(str(n_files))
+					#print(str(st_size))	
+					#print(str((stringTable)))
+					for i in range(n_files):
+						i = n_files - i - 1
+						pos=0x10 + i * 0x40
+						offset = data[pos:pos+8]
+						offset=int.from_bytes(offset, byteorder='little')			
+						size = data[pos+8:pos+16]
+						size=int.from_bytes(size, byteorder='little')			
+						nameOffset = data[pos+16:pos+20] # just the offset
+						nameOffset=int.from_bytes(nameOffset, byteorder='little')			
+						name = stringTable[nameOffset:stringEndOffset].decode('utf-8').rstrip(' \t\r\n\0')
+						stringEndOffset = nameOffset
+						junk2 = data[pos+20:pos+24] # junk data
+						#print(name)
+						#print(offset)	
+						#print(size)	
+						off1=offset+headerSize+secureOffset
+						off2=off1+size
+						files_list.append([name,off1,off2,size])	
+						# with open(filename, 'r+b') as f:	
+							# f.seek(off1)
+							# print(f.read(0x4))
+					files_list.reverse()	
+					#print(files_list)	
+		except BaseException as e:
+			Print.error('Exception: ' + str(e))					
+	except BaseException as e:
+		Print.error('Exception: ' + str(e))
+	return files_list

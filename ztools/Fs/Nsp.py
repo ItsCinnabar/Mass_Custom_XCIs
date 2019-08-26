@@ -7,6 +7,7 @@ from struct import pack as pk, unpack as upk
 from Fs.File import File
 from hashlib import sha256
 import Fs.Type
+from Fs import Type
 import os
 import re
 import pathlib
@@ -19,11 +20,19 @@ from tqdm import tqdm
 from Fs.Pfs0 import Pfs0
 from Fs.Ticket import Ticket
 from Fs.Nca import Nca
+from Fs.Nacp import Nacp
+from Fs.Nca import NcaHeader
+from Fs.File import MemoryFile
+from Fs.pyNCA3 import NCA3
+from Fs.pyNPDM import NPDM
 import math  
 import sys
+import shutil
 if sys.platform == 'win32':
 	import win32con, win32api
 from operator import itemgetter, attrgetter, methodcaller
+from Crypto.Cipher import AES
+import io
 #from Cryptodome.Signature import pss
 #from Cryptodome.PublicKey import RSA
 #from Cryptodome import Random
@@ -352,6 +361,74 @@ class Nsp(Pfs0):
 		self.hasValidTicket = True
 		self.move()
 
+
+	# ...................................................						
+	# Patch requrements for network account
+	# ...................................................
+	def gen_ctrl_list(self):
+		print('- Seeking control nca files...')
+		ctrl_list=list()
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					ctrl_list.append(nca._path)
+				else:
+					pass
+		return ctrl_list
+	
+	def patch_netlicense(self,item=False):
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					if item == False or nca._path == item:				
+						check=nca.patch_netlicense()
+						return check
+
+	def reb_lv_hashes(self,item=False):					
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':					
+					if item == False or nca._path == item:	
+						print('-------------------------------------------------')							
+						print('Get Current IVFC level data:')		
+						print('-------------------------------------------------')						
+						leveldata,superhashoffset=nca.redo_lvhashes()					
+						return leveldata,superhashoffset
+
+	def set_lv_hash(self,j,leveldata,item=False):					
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':				
+					if item == False or nca._path == item:	
+						print('-------------------------------------------------')							
+						print('Rebuild hashes for IVFC level '+str(j)+':')		
+						print('-------------------------------------------------')							
+						nca.set_lv_hash(j,leveldata)
+					
+	def set_lvsuperhash(self,leveldata,superhashoffset,item=False):					
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					if item == False or nca._path == item:				
+						print('-------------------------------------------------')							
+						print('Rebuild IVFC superhash:')		
+						print('-------------------------------------------------')						
+						nca.set_lvsuperhash(leveldata,superhashoffset)						
+
+	def ctrl_upd_hblock_hash(self,item=False):					
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					if item == False or nca._path == item:	
+						print('-------------------------------------------------')							
+						print('Rebuild nca hash-table:')		
+						print('-------------------------------------------------')							
+						oldhash=nca.header.get_hblock_hash();print('- Old nca sblock hash: '+str(hx(oldhash)))	
+						newhash=nca.header.calculate_hblock_hash();print('- New nca sblock hash: '+str(hx(newhash)))
+						nca.header.set_hblock_hash(newhash)
+										
+	# ...................................................											
+										
 	def setMasterKeyRev(self, newMasterKeyRev):
 		if not Titles.contains(self.titleId):
 			raise IOError('No title key found in database! ' + self.titleId)
@@ -481,6 +558,31 @@ class Nsp(Pfs0):
 				nca.header.setRightsId(0)
 				nca.header.setKeyBlock(encKeyBlock)
 				Hex.dump(encKeyBlock)
+
+#Extract all files
+	def extract_all(self,ofolder,buffer):
+		indent = 1
+		tabs = '\t' * indent
+		print("Processing: "+str(self._path))
+		for file in self:
+			file.rewind()
+			filename =  str(file._path)
+			outfolder = str(ofolder)+'/'
+			filepath = os.path.join(outfolder, filename)
+			if not os.path.exists(outfolder):
+				os.makedirs(outfolder)
+			fp = open(filepath, 'w+b')
+			file.rewind()
+			t = tqdm(total=file.size, unit='B', unit_scale=True, leave=False)
+			t.write(tabs+'Copying: ' + str(filename))
+			for data in iter(lambda: file.read(int(buffer)), ""):
+				fp.write(data)
+				t.update(len(data))
+				fp.flush()
+				if not data:
+					fp.close()
+					t.close()	
+					break					
 				
 	def copy_ticket(self,ofolder):
 		for ticket in self:
@@ -582,15 +684,389 @@ class Nsp(Pfs0):
 									fp.close()
 									break		
 
-	def copy_ncap(self,ofolder,buffer):
+	def copy_nacp(self,ofolder,buffer=32768):
 		for nca in self:
 			if type(nca) == Nca:
 				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					ncaname =  str(nca._path)[:-4]+'_nca'
+					ncafolder = os.path.join(ofolder,ncaname)
+					filename = 'control.nacp'
+					filepath = os.path.join(ncafolder,filename)
+					if not os.path.exists(ncafolder):
+						os.makedirs(ncafolder)
+					offset=nca.get_nacp_offset()
 					for f in nca:
-						nca.copy(ofolder,buffer)
+						totSize=f.size-offset
+						t = tqdm(total=totSize, unit='B', unit_scale=True, leave=False)
+						t.write('- Writing control.nacp...')					
+						f.seek(offset)
+						fp = open(filepath, 'w+b')		
+						for data in iter(lambda: f.read(int(buffer)), ""):
+							fp.write(data)
+							fp.flush()
+							t.update(len(data))
+							if not data:
+								fp.close()
+								t.close()
+								break	
+						break	
+					print('  DONE')		
 
-						
+	def copy_as_plaintext(self,ofolder,files_list,buffer=32768):
+		for nca in self:
+			tk=None;skip=False
+			if type(nca) == Nca:
+				for fs in nca.sectionFilesystems:
+					if fs.cryptoType == Type.Crypto.BKTR:
+						skip=True
+						break					
+				if nca.header.getRightsId() != 0:
+					correct, tkey = self.verify_nca_key(str(nca._path))		
+					if correct == True:
+						crypto1=nca.header.getCryptoType()
+						crypto2=nca.header.getCryptoType2()	
+						if crypto2>crypto1:
+							masterKeyRev=crypto2
+						if crypto2<=crypto1:	
+							masterKeyRev=crypto1	
+						tk = Keys.decryptTitleKey(tkey, Keys.getMasterKeyIndex(int(masterKeyRev)))
+				else:
+					tk=nca.header.titleKeyDec
+				if skip == False:							
+					ncaname =  str(nca._path)
+					PN = os.path.join(ofolder,ncaname)
+					if not os.path.exists(ofolder):
+						os.makedirs(ofolder)
+					for i in range(len(files_list)):	
+						if str(nca._path) == files_list[i][0]:
+							offset=files_list[i][1]
+							#print(offset)
+							break
+					#print(nca.size)	
+					#print(str(nca._path)[-9:])
+					lon=0;test=str(nca._path)[-9:]
+					if test=='.cnmt.nca':
+						ext='.plain.cnmt.nca'
+					else:
+						ext='.plain.nca'
+					lon=(-1)*len(ext)	
+					try:
+						fp=open(str(self._path), 'rb')			
+						nca3=NCA3(fp,int(offset),str(nca._path),tk)
+						nca3.decrypt_to_plaintext(PN.replace(str(nca._path)[lon:], ext))
+						fp.close();
+					except BaseException as e:
+						#Print.error('Exception: ' + str(e))
+						if nca.size<int(1073725440):							
+							try:
+								nca.rewind()
+								inmemoryfile = io.BytesIO(nca.read())
+								nca3=NCA3(inmemoryfile,0,str(nca._path),tk,buffer)					
+								nca3.decrypt_to_plaintext(PN.replace(str(nca._path)[lon:], ext))
+							except BaseException as e:
+								#Print.error('Exception: ' + str(e))
+								try:																				
+									with open(str(self._path), 'rb') as f:
+										f.seek(offset)
+										inmemoryfile = io.BytesIO(f.read(files_list[i][3]))
+										nca3=NCA3(inmemoryfile,int(0),str(nca._path),tk,buffer)
+										nca3.decrypt_to_plaintext(PN.replace(str(nca._path)[lon:], ext))								
+								except BaseException as e:
+									#Print.error('Exception: ' + str(e))	
+									t = tqdm(total=nca.size, unit='B', unit_scale=True, leave=False)
+									t.write(str(nca._path)+' needs to be pre-extracted')
+									outnca=open(str(PN), 'w+b')	
+									nca.rewind()											
+									try:											
+										for data in iter(lambda: nca.read(int(buffer)), ""):							
+											outnca.write(data)				
+											t.update(len(data))								
+											outnca.flush()						
+											if not data:
+												outnca.close()
+												t.close()
+												break																			
+										with open(str(PN), 'rb') as f:
+											nca3=NCA3(f,int(0),str(nca._path),tk,buffer)
+											nca3.decrypt_to_plaintext(PN.replace(str(nca._path)[lon:], ext))								
+										try:
+											os.remove(str(PN)) 	
+										except:
+											pass									
+									except BaseException as e:
+										Print.error('Exception: ' + str(e))	
+										outnca.close()
+										t.close()												
+										try:
+											os.remove(str(PN)) 	
+										except:
+											pass
+										continue											
+						else:
+							t = tqdm(total=nca.size, unit='B', unit_scale=True, leave=False)	
+							t.write(str(nca._path)+' needs to be pre-extracted')
+							outnca=open(str(PN), 'w+b')	
+							nca.rewind()
+							for data in iter(lambda: nca.read(int(buffer)), ""):	
+								try:									
+									nca.rewind()
+									for data in iter(lambda: nca.read(int(buffer)), ""):							
+										outnca.write(data)				
+										t.update(len(data))							
+										outnca.flush()						
+										if not data:
+											outnca.close()
+											t.close()
+											break											
+									with open(str(PN), 'rb') as f:
+										nca3=NCA3(f,int(0),str(nca._path),tk,buffer)
+										nca3.decrypt_to_plaintext(PN.replace(str(nca._path)[lon:], ext))								
+									try:
+										os.remove(str(PN)) 	
+									except:
+										pass									
+								except BaseException as e:
+									Print.error('Exception: ' + str(e))
+									outnca.close()
+									t.close()
+									try:
+										os.remove(str(PN)) 	
+									except:
+										pass																	
+									continue											
+							
+	def read_npdm(self,files_list,buffer=32768):
+		feed=''
+		for nca in self:
+			if type(nca) == Fs.Nca and nca.header.getRightsId() == 0:
+				if 	str(nca.header.contentType) == 'Content.PROGRAM':
+					for i in range(len(files_list)):	
+						if str(nca._path) == files_list[i][0]:
+							offset=files_list[i][1]
+							#print(offset)
+							break					
+					decKey=nca.header.titleKeyDec
+					try:
+						fp=open(str(self._path), 'rb')			
+						nca3=NCA3(fp,int(offset),str(nca._path),decKey)
+						feed=nca3.print_npdm()
+						fp.close();
+					except BaseException as e:
+						#Print.error('Exception: ' + str(e))
+						nca.rewind()					
+						for f in nca:						
+							for g in f:
+								if str(g._path)=='main.npdm':
+									inmemoryfile = io.BytesIO(g.read())
+									npdm = NPDM(inmemoryfile)
+									n=npdm.__str__()
+									print(n)	
+			if type(nca) == Fs.Nca and nca.header.getRightsId() != 0:
+				if 	str(nca.header.contentType) == 'Content.PROGRAM':	
+					correct, tkey = self.verify_nca_key(str(nca._path))		
+					if correct == True:
+						crypto1=nca.header.getCryptoType()
+						crypto2=nca.header.getCryptoType2()	
+						if crypto2>crypto1:
+							masterKeyRev=crypto2
+						if crypto2<=crypto1:	
+							masterKeyRev=crypto1	
+						decKey = Keys.decryptTitleKey(tkey, Keys.getMasterKeyIndex(int(masterKeyRev)))
+					for i in range(len(files_list)):	
+						if str(nca._path) == files_list[i][0]:
+							offset=files_list[i][1]
+							#print(offset)
+							break						
+					try:
+						fp=open(str(self._path), 'rb')			
+						nca3=NCA3(fp,int(offset),str(nca._path),decKey)
+						feed=nca3.print_npdm()
+						fp.close();
+					except BaseException as e:
+						#Print.error('Exception: ' + str(e))
+						nca.rewind()
+						for fs in nca.sectionFilesystems:
+							#print(fs.fsType)
+							#print(fs.cryptoType)						
+							if fs.fsType == Type.Fs.PFS0 and fs.cryptoType == Type.Crypto.CTR:
+								nca.seek(0)
+								ncaHeader = NcaHeader()
+								ncaHeader.open(MemoryFile(nca.read(0x400), Type.Crypto.XTS, uhx(Keys.get('header_key'))))	
+								ncaHeader.seek(0)
+								fs.rewind()
+								pfs0=fs
+								sectionHeaderBlock = fs.buffer
+								nca.seek(fs.offset)	
+								pfs0Offset=fs.offset
+								pfs0Header = nca.read(0x10*14)
+								mem = MemoryFile(pfs0Header, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = pfs0Offset)
+								data = mem.read();
+								#Hex.dump(data)	
+								head=data[0:4]
+								n_files=(data[4:8])
+								n_files=int.from_bytes(n_files, byteorder='little')		
+								st_size=(data[8:12])
+								st_size=int.from_bytes(st_size, byteorder='little')		
+								junk=(data[12:16])
+								offset=(0x10 + n_files * 0x18)
+								stringTable=(data[offset:offset+st_size])
+								stringEndOffset = st_size
+								headerSize = 0x10 + 0x18 * n_files + st_size
+								#print(head)
+								#print(str(n_files))
+								#print(str(st_size))	
+								#print(str((stringTable)))		
+								files_list=list()
+								for i in range(n_files):
+									i = n_files - i - 1
+									pos=0x10 + i * 0x18
+									offset = data[pos:pos+8]
+									offset=int.from_bytes(offset, byteorder='little')			
+									size = data[pos+8:pos+16]
+									size=int.from_bytes(size, byteorder='little')			
+									nameOffset = data[pos+16:pos+20] # just the offset
+									nameOffset=int.from_bytes(nameOffset, byteorder='little')			
+									name = stringTable[nameOffset:stringEndOffset].decode('utf-8').rstrip(' \t\r\n\0')
+									stringEndOffset = nameOffset
+									junk2 = data[pos+20:pos+24] # junk data
+									#print(name)
+									#print(offset)	
+									#print(size)	
+									files_list.append([name,offset,size])	
+								files_list.reverse()	
+								#print(files_list)								
+								for i in range(len(files_list)):
+									if files_list[i][0] == 'main.npdm':
+										off1=files_list[i][1]+pfs0Offset+headerSize
+										nca.seek(off1)
+										np=nca.read(files_list[i][2])
+										mem = MemoryFile(np, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = off1)
+										data = mem.read();
+										#Hex.dump(data)										
+										inmemoryfile = io.BytesIO(data)
+										npdm = NPDM(inmemoryfile)
+										n=npdm.__str__()
+										print(n)
+										break	
+							break	
+		return feed						
 
+	def extract_nca(self,ofolder,files_list,buffer=32768):
+		for nca in self:
+			tk=None;skip=False						
+			if type(nca) == Nca:
+				for fs in nca.sectionFilesystems:
+					if fs.cryptoType == Type.Crypto.BKTR:
+						skip=True
+						break						
+				if nca.header.getRightsId() != 0:
+					correct, tkey = self.verify_nca_key(str(nca._path))		
+					if correct == True:
+						crypto1=nca.header.getCryptoType()
+						crypto2=nca.header.getCryptoType2()	
+						if crypto2>crypto1:
+							masterKeyRev=crypto2
+						if crypto2<=crypto1:	
+							masterKeyRev=crypto1	
+						tk = Keys.decryptTitleKey(tkey, Keys.getMasterKeyIndex(int(masterKeyRev)))
+				else:
+					tk=nca.header.titleKeyDec	
+			if skip == False:							
+				if type(nca) == Nca:
+					ncaname =  str(nca._path)[:-4]+'_nca'
+					ncafolder = os.path.join(ofolder,ncaname)
+					ncaname2 =  str(nca._path)
+					PN = os.path.join(ofolder,ncaname2)							
+					if not os.path.exists(ncafolder):
+						os.makedirs(ncafolder)			
+					for i in range(len(files_list)):	
+						if str(nca._path) == files_list[i][0]:
+							offset=files_list[i][1]
+							break
+					#t = tqdm(total=nca.size, unit='B', unit_scale=True, leave=False)				
+					try:
+						fp=open(str(self._path), 'rb')			
+						nca3=NCA3(fp,int(offset),str(nca._path),tk,buffer)
+						nca3.extract_conts(ncafolder, disp=True)
+						fp.close()
+					except:	
+						#Print.error('Exception: ' + str(e))
+						if nca.size<int(1073725440):								
+							try:					
+								nca.rewind()
+								inmemoryfile = io.BytesIO(nca.read())
+								nca3=NCA3(inmemoryfile,0,str(nca._path),tk,buffer)					
+								nca3.extract_conts(ncafolder, disp=True)	
+							except BaseException as e:
+								#Print.error('Exception: ' + str(e))
+								try:																				
+									with open(str(self._path), 'rb') as f:
+										f.seek(offset)
+										inmemoryfile = io.BytesIO(f.read(files_list[i][3]))
+										nca3=NCA3(inmemoryfile,int(0),str(nca._path),tk,buffer)
+										nca3.extract_conts(ncafolder, disp=True)											
+								except BaseException as e:
+									#Print.error('Exception: ' + str(e))	
+									t = tqdm(total=nca.size, unit='B', unit_scale=True, leave=False)	
+									t.write(str(nca._path)+' needs to be pre-extracted')							
+									outnca=open(str(PN), 'w+b')	
+									nca.rewind()
+									try:
+										for data in iter(lambda: nca.read(int(buffer)), ""):							
+											outnca.write(data)				
+											t.update(len(data))							
+											outnca.flush()						
+											if not data:
+												outnca.close()
+												t.close()
+												break																					
+										with open(str(PN), 'rb') as f:
+											nca3=NCA3(f,int(0),str(nca._path),tk,buffer)
+											nca3.extract_conts(ncafolder, disp=True)										
+										try:
+											os.remove(str(PN)) 	
+										except:
+											pass									
+									except BaseException as e:
+										Print.error('Exception: ' + str(e))	
+										outnca.close()
+										t.close()												
+										try:
+											os.remove(str(PN)) 	
+										except:
+											pass																	
+										continue														
+						else:
+							t = tqdm(total=nca.size, unit='B', unit_scale=True, leave=False)
+							t.write(str(nca._path)+' needs to be pre-extracted')									
+							outnca=open(str(PN), 'w+b')	
+							nca.rewind()
+							try:
+								for data in iter(lambda: nca.read(int(buffer)), ""):							
+									outnca.write(data)				
+									t.update(len(data))								
+									outnca.flush()						
+									if not data:
+										outnca.close()
+										t.close()	
+										break																			
+								with open(str(PN), 'rb') as f:
+									nca3=NCA3(f,int(0),str(nca._path),tk,buffer)
+									nca3.extract_conts(ncafolder, disp=True)										
+								try:
+									os.remove(str(PN)) 	
+								except:
+									pass									
+							except BaseException as e:
+								Print.error('Exception: ' + str(e))		
+								outnca.close()
+								t.close()												
+								try:
+									os.remove(str(PN)) 	
+								except:
+									pass																	
+								continue									
+			
 	def copy_nca_manual(self,ofolder,buffer):
 		for nca in self:
 			if type(nca) == Nca:
@@ -682,7 +1158,7 @@ class Nsp(Pfs0):
 	def copy_nca_pdata(self,ofolder,buffer):
 		for nca in self:
 			if type(nca) == Nca:
-				if 	str(nca.header.contentType) == 'Content.UNKNOWN':
+				if 	str(nca.header.contentType) == 'Content.PUBLIC_DATA':
 					nca.rewind()
 					filename =  str(nca._path)
 					outfolder = str(ofolder)+'/'
@@ -871,7 +1347,6 @@ class Nsp(Pfs0):
 					if nca.header.getCryptoType2() == 0:
 						if nca.header.getCryptoType() == 2:
 							masterKeyRev = 2						
-							titleKeyDec = Keys.decryptTitleKey(ticket.getTitleKeyBlock().to_bytes(16, byteorder='big'), Keys.getMasterKeyIndex(masterKeyRev))
 							break								
 
 		ticket.setRightsId(0)
@@ -919,10 +1394,22 @@ class Nsp(Pfs0):
 		return masterKeyRev
 		
 	def nsptitlekeydec(self):				
-		if not Titles.contains(self.titleId):
-			raise IOError('No title key found in database! ' + self.titleId)
 		ticket = self.ticket()
-		masterKeyRev = ticket.getMasterKeyRevision()
+		for nca in self:	
+			if type(nca) == Nca:		
+				crypto1=nca.header.getCryptoType()
+				crypto2=nca.header.getCryptoType2()	
+				if crypto1 == 2:
+					if crypto1 > crypto2:								
+						masterKeyRev=nca.header.getCryptoType()
+					else:			
+						masterKeyRev=nca.header.getCryptoType2()	
+				else:			
+					masterKeyRev=nca.header.getCryptoType2()	
+				if nca.header.getRightsId() != 0:						
+					break		
+
+					
 		titleKeyDec = Keys.decryptTitleKey(ticket.getTitleKeyBlock().to_bytes(16, byteorder='big'), Keys.getMasterKeyIndex(masterKeyRev))
 		rightsId = ticket.getRightsId()
 		titleKey = ticket.getTitleKeyBlock().to_bytes(16, byteorder='big')
@@ -1073,8 +1560,9 @@ class Nsp(Pfs0):
 				filename =  str(file._path)
 				Print.info(str(filename))
 #ADVANCED FILE-LIST			
-	def  adv_file_list(self):
+	def  adv_file_list(self):		
 		contentlist=list()	
+		feed=''
 		for nca in self:
 			size1=0;size2=0;size3=0	
 			if type(nca) == Nca:	
@@ -1103,6 +1591,9 @@ class Nsp(Pfs0):
 								content_type='Update'
 								reqtag='- RequiredSystemVersion: '
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)							
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'									
 								if isdemo == 1:
 									content_type='Demo Update'
 								if isdemo == 2:
@@ -1115,6 +1606,9 @@ class Nsp(Pfs0):
 								content_type='Game or Application'
 								reqtag='- RequiredSystemVersion: '	
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)	
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'									
 								if isdemo == 1:
 									content_type='Demo'
 								if isdemo == 2:
@@ -1135,54 +1629,58 @@ class Nsp(Pfs0):
 									keygen=nca.header.getCryptoType2()	
 							else:			
 								keygen=nca.header.getCryptoType2()		
+							programSDKversion,dataSDKversion=self.getsdkvertit(titleid2)									
+							sdkversion=nca.get_sdkversion()								
 							MinRSV=sq_tools.getMinRSV(keygen,min_sversion)
 							FW_rq=sq_tools.getFWRangeKG(keygen)
 							RSV_rq=sq_tools.getFWRangeRSV(min_sversion)									
-							RSV_rq_min=sq_tools.getFWRangeRSV(MinRSV)								
-							Print.info('-----------------------------')
-							Print.info('CONTENT ID: ' + str(titleid2))	
-							Print.info('-----------------------------')			
-							if content_type_cnmt != 'AddOnContent':									
-								Print.info("Titleinfo:")							
-								Print.info("- Name: " + tit_name)
-								Print.info("- Editor: " + editor)
-								Print.info("- Build number: " + str(ediver))
+							RSV_rq_min=sq_tools.getFWRangeRSV(MinRSV)	
+							message=('-----------------------------');print(message);feed+=message+'\n'	
+							message=('CONTENT ID: ' + str(titleid2));print(message);feed+=message+'\n'									
+							message=('-----------------------------');print(message);feed+=message+'\n'									
+							if content_type_cnmt != 'AddOnContent':		
+								message=("Titleinfo:");print(message);feed+=message+'\n'
+								message=("- Name: " + tit_name);print(message);feed+=message+'\n'
+								message=("- Editor: " + editor);print(message);feed+=message+'\n'
+								message=("- Build number: " + str(ediver));print(message);feed+=message+'\n'								
+								message=("- Meta SDK version: " + sdkversion);print(message);feed+=message+'\n'	
+								message=("- Program SDK version: " + programSDKversion);print(message);feed+=message+'\n'
 								suplangue=str((', '.join(SupLg)))
-								Print.info("- Supported Languages: "+suplangue)
-								Print.info("- Content type: "+content_type)
-								Print.info("- Version: " + version+' -> '+content_type_cnmt+' ('+str(v_number)+')')
+								message=("- Supported Languages: "+suplangue);print(message);feed+=message+'\n'								
+								message=("- Content type: "+content_type);print(message);feed+=message+'\n'	
+								message=("- Version: " + version+' -> '+content_type_cnmt+' ('+str(v_number)+')');print(message);feed+=message+'\n'								
 							if content_type_cnmt == 'AddOnContent':
 								if tit_name != "DLC":
-									Print.info("- Name: " + tit_name)
-									Print.info("- Editor: " + editor)										
-								Print.info("- Content type: "+"DLC")
+									message=("- Name: " + tit_name);print(message);feed+=message+'\n'
+									message=("- Editor: " + editor);print(message);feed+=message+'\n'	
+								message=("- Content type: "+"DLC");print(message);feed+=message+'\n'									
 								DLCnumb=str(titleid2)
 								DLCnumb="0000000000000"+DLCnumb[-3:]									
 								DLCnumb=bytes.fromhex(DLCnumb)
 								DLCnumb=str(int.from_bytes(DLCnumb, byteorder='big'))									
 								DLCnumb=int(DLCnumb)
-								Print.info("- DLC number: "+str(DLCnumb)+' -> '+"AddOnContent"+' ('+str(DLCnumb)+')')						
-								Print.info("- DLC version Number: " + version+' -> '+"Version"+' ('+str(v_number)+')')												
-							Print.info("")								
-							Print.info("Required Firmware:")			
+								message=("- DLC number: "+str(DLCnumb)+' -> '+"AddOnContent"+' ('+str(DLCnumb)+')');print(message);feed+=message+'\n'
+								message=("- DLC version Number: " + version+' -> '+"Version"+' ('+str(v_number)+')');print(message);feed+=message+'\n'
+								message=("- Meta SDK version: " + sdkversion);print(message);feed+=message+'\n'
+								message=("- Data SDK version: " + dataSDKversion);print(message);feed+=message+'\n'								
+							message=("\nRequired Firmware:");print(message);feed+=message+'\n'									
 							if content_type_cnmt == 'AddOnContent':
 								if v_number == 0:
-									Print.info("- Required game version: " + str(min_sversion)+' -> '+"Application"+' ('+str(RS_number)+')')									
+									message=("- Required game version: " + str(min_sversion)+' -> '+"Application"+' ('+str(RS_number)+')');print(message);feed+=message+'\n'																
 								if v_number > 0:
-									Print.info("- Required game version: " + str(min_sversion)+' -> '+"Patch"+' ('+str(RS_number)+')')																									
+									message=("- Required game version: " + str(min_sversion)+' -> '+"Patch"+' ('+str(RS_number)+')');print(message);feed+=message+'\n'																																	
 							else:
-								Print.info(reqtag + str(min_sversion)+" -> " +RSV_rq)						
-							Print.info('- Encryption (keygeneration): ' + str(keygen)+" -> " +FW_rq)
-							if content_type_cnmt != 'AddOnContent':							
-								Print.info('- Patchable to: ' + str(MinRSV)+" -> " + RSV_rq_min)
+								message=(reqtag + str(min_sversion)+" -> " +RSV_rq);print(message);feed+=message+'\n'	
+							message=('- Encryption (keygeneration): ' + str(keygen)+" -> " +FW_rq);print(message);feed+=message+'\n'								
+							if content_type_cnmt != 'AddOnContent':	
+								message=('- Patchable to: ' + str(MinRSV)+" -> " + RSV_rq_min);print(message);feed+=message+'\n'															
 							else:
-								Print.info('- Patchable to: DLC -> no RSV to patch')	
-							Print.info("")									
+								message=('- Patchable to: DLC -> no RSV to patch\n');print(message);feed+=message+'\n'																														
 							ncalist = list()
-							ncasize = 0							
-							Print.info('......................')							
-							Print.info('NCA FILES (NON DELTAS)')	
-							Print.info('......................')							
+							ncasize = 0		
+							message=('......................');print(message);feed+=message+'\n'		
+							message=('NCA FILES (NON DELTAS)');print(message);feed+=message+'\n'
+							message=('......................');print(message);feed+=message+'\n'													
 							for i in range(content_entries):
 								vhash = cnmt.read(0x20)
 								NcaId = cnmt.read(0x10)
@@ -1194,7 +1692,8 @@ class Nsp(Pfs0):
 								if ncatype != 6:									
 									nca_name=str(hx(NcaId))
 									nca_name=nca_name[2:-1]+'.nca'
-									ncasize=ncasize+self.print_nca_by_title(nca_name,ncatype)
+									s1=0;s1,feed=self.print_nca_by_title(nca_name,ncatype,feed)									
+									ncasize=ncasize+s1
 									ncalist.append(nca_name[:-4])
 									contentlist.append(nca_name)									
 								if ncatype == 6:
@@ -1204,13 +1703,14 @@ class Nsp(Pfs0):
 									contentlist.append(nca_name)										
 							nca_meta=str(nca._path)
 							ncalist.append(nca_meta[:-4])	
-							contentlist.append(nca_meta)							
-							ncasize=ncasize+self.print_nca_by_title(nca_meta,0)
+							contentlist.append(nca_meta)
+							s1=0;s1,feed=self.print_nca_by_title(nca_meta,0,feed)							
+							ncasize=ncasize+s1
 							size1=ncasize
 							size_pr=sq_tools.getSize(ncasize)		
 							bigtab="\t"*7
-							Print.info(bigtab+"  --------------------")								
-							Print.info(bigtab+'  TOTAL SIZE: '+size_pr)	
+							message=(bigtab+"  --------------------");print(message);feed+=message+'\n'		
+							message=(bigtab+'  TOTAL SIZE: '+size_pr);print(message);feed+=message+'\n'									
 							if self.actually_has_deltas(ncalist)=="true":
 								cnmt.rewind()
 								cnmt.seek(0x20+offset)
@@ -1221,10 +1721,10 @@ class Nsp(Pfs0):
 									ncatype = cnmt.read(0x1)
 									ncatype = int.from_bytes(ncatype, byteorder='little')		
 									unknown = cnmt.read(0x1)								
-									if ncatype == 6:							
-										Print.info('......................')							
-										Print.info('NCA FILES (DELTAS)')	
-										Print.info('......................')	
+									if ncatype == 6:	
+										message=('......................');print(message);feed+=message+'\n'
+										message=('NCA FILES (DELTAS)');print(message);feed+=message+'\n'										
+										message=('......................');print(message);feed+=message+'\n'											
 										break
 								cnmt.rewind()
 								cnmt.seek(0x20+offset)
@@ -1239,34 +1739,37 @@ class Nsp(Pfs0):
 									if ncatype == 6:
 										nca_name=str(hx(NcaId))
 										nca_name=nca_name[2:-1]+'.nca'
-										ncasize=ncasize+self.print_nca_by_title(nca_name,ncatype)
+										s1=0;s1,feed=self.print_nca_by_title(nca_name,ncatype,feed)
+										ncasize=ncasize+s1
 								size2=ncasize
 								size_pr=sq_tools.getSize(ncasize)		
 								bigtab="\t"*7
-								Print.info(bigtab+"  --------------------")								
-								Print.info(bigtab+'  TOTAL SIZE: '+size_pr)	
-							if self.actually_has_other(titleid2,ncalist)=="true":								
-								Print.info('......................')							
-								Print.info('OTHER TYPES OF FILES')	
-								Print.info('......................')
-								othersize = 0								
-								othersize=othersize+self.print_xml_by_title(ncalist,contentlist)	
-								othersize=othersize+self.print_tac_by_title(titleid2,contentlist)
-								othersize=othersize+self.print_jpg_by_title(ncalist,contentlist)
+								message=(bigtab+"  --------------------");print(message);feed+=message+'\n'
+								message=(bigtab+'  TOTAL SIZE: '+size_pr);print(message);feed+=message+'\n'										
+							if self.actually_has_other(titleid2,ncalist)=="true":	
+								message=('......................');print(message);feed+=message+'\n'
+								message=('OTHER TYPES OF FILES');print(message);feed+=message+'\n'										
+								message=('......................');print(message);feed+=message+'\n'							
+								othersize=0;os1=0;os2=0;os3=0
+								os1,feed=self.print_xml_by_title(ncalist,contentlist,feed)
+								os2,feed=self.print_tac_by_title(titleid2,contentlist,feed)
+								os3,feed=self.print_jpg_by_title(ncalist,contentlist,feed)
+								othersize=othersize+os1+os2+os3	
 								size3=othersize								
 								size_pr=sq_tools.getSize(othersize)							
 								bigtab="\t"*7
-								Print.info(bigtab+"  --------------------")								
-								Print.info(bigtab+'  TOTAL SIZE: '+size_pr)
+								message=(bigtab+"  --------------------");print(message);feed+=message+'\n'
+								message=(bigtab+'  TOTAL SIZE: '+size_pr);print(message);feed+=message+'\n'										
 					finalsize=size1+size2+size3	
 					size_pr=sq_tools.getSize(finalsize)	
-					Print.info("/////////////////////////////////////")							
-					Print.info('   FULL CONTENT TOTAL SIZE: '+size_pr+"   ")
-					Print.info("/////////////////////////////////////")	
-		self.printnonlisted(contentlist)
+					message=("/////////////////////////////////////");print(message);feed+=message+'\n'
+					message=('   FULL CONTENT TOTAL SIZE: '+size_pr+"   ");print(message);feed+=message+'\n'						
+					message=("/////////////////////////////////////");print(message);feed+=message+'\n'					
+		self.printnonlisted(contentlist,feed)
+		return feed
 					
 																				
-	def print_nca_by_title(self,nca_name,ncatype):	
+	def print_nca_by_title(self,nca_name,ncatype,feed):	
 		tab="\t"
 		for nca in self:
 			if type(nca) == Nca:
@@ -1278,11 +1781,11 @@ class Nsp(Pfs0):
 					content=content[8:]+": "
 					ncatype=sq_tools.getTypeFromCNMT(ncatype)	
 					if ncatype != "Meta: ":
-						Print.info("- "+ncatype+tab+str(filename)+tab+tab+"Size: "+size_pr)	
+						message=("- "+ncatype+tab+str(filename)+tab+tab+"Size: "+size_pr);print(message);feed+=message+'\n'						
 					else:
-						Print.info("- "+ncatype+tab+str(filename)+tab+"Size: "+size_pr)		
-					return size		
-	def print_xml_by_title(self,ncalist,contentlist):	
+						message=("- "+ncatype+tab+str(filename)+tab+"Size: "+size_pr);print(message);feed+=message+'\n'					
+					return size,feed		
+	def print_xml_by_title(self,ncalist,contentlist,feed):	
 		tab="\t"
 		size2return=0
 		for file in self:
@@ -1292,11 +1795,11 @@ class Nsp(Pfs0):
 				filename =  str(file._path)	
 				xml=filename[:-4]
 				if xml in ncalist:
-					Print.info("- XML: "+tab*2+str(filename)+tab+"Size: "+size_pr)
+					message=("- XML: "+tab*2+str(filename)+tab+"Size: "+size_pr);print(message);feed+=message+'\n'
 					contentlist.append(filename)	
 					size2return=size+size2return			
-		return size2return						
-	def print_tac_by_title(self,titleid,contentlist):		
+		return size2return,feed						
+	def print_tac_by_title(self,titleid,contentlist,feed):		
 		tab="\t"	
 		size2return=0		
 		for ticket in self:
@@ -1306,7 +1809,7 @@ class Nsp(Pfs0):
 				filename =  str(ticket._path)
 				tik=filename[:-20]
 				if tik == titleid:
-					Print.info("- Ticket: "+tab+str(filename)+tab*2+"Size: "+size_pr)	
+					message=("- Ticket: "+tab+str(filename)+tab*2+"Size: "+size_pr);print(message);feed+=message+'\n'				
 					contentlist.append(filename)					
 					size2return=size+size2return													
 		for cert in self:					
@@ -1316,11 +1819,11 @@ class Nsp(Pfs0):
 				filename = str(cert._path)
 				cert_id =filename[:-21]
 				if cert_id == titleid:
-					Print.info("- Cert: "+tab+str(filename)+tab*2+"Size: "+size_pr)
+					message=("- Cert: "+tab+str(filename)+tab*2+"Size: "+size_pr);print(message);feed+=message+'\n'
 					contentlist.append(filename)					
 					size2return=size+size2return
-		return size2return				
-	def print_jpg_by_title(self,ncalist,contentlist):	
+		return size2return,feed			
+	def print_jpg_by_title(self,ncalist,contentlist,feed):	
 		size2return=0
 		tab="\t"
 		for file in self:
@@ -1330,10 +1833,10 @@ class Nsp(Pfs0):
 				filename =  str(file._path)	
 				jpg=filename[:32]
 				if jpg in ncalist:
-					Print.info("- JPG: "+tab*2+"..."+str(filename[-38:])+tab+"Size: "+size_pr)		
+					message=("- JPG: "+tab*2+"..."+str(filename[-38:])+tab+"Size: "+size_pr);print(message);feed+=message+'\n'
 					contentlist.append(filename)					
 					size2return=size+size2return
-		return size2return		
+		return size2return,feed
 	def actually_has_deltas(self,ncalist):	
 		vfragment="false"	
 		for nca in self:
@@ -1375,7 +1878,7 @@ class Nsp(Pfs0):
 					vother="true"	
 					break	
 		return vother					
-	def printnonlisted(self,contentlist):
+	def printnonlisted(self,contentlist,feed):
 		tab="\t"	
 		list_nonlisted="false"
 		for file in self:
@@ -1383,24 +1886,25 @@ class Nsp(Pfs0):
 			if not filename in contentlist:
 				list_nonlisted="true"
 		if list_nonlisted == "true":
-			Print.info('-----------------------------------')
-			Print.info('FILES NOT LINKED TO CONTENT IN NSP')
-			Print.info('-----------------------------------')	
+			message=('-----------------------------------');print(message);feed+=message+'\n'
+			message=('FILES NOT LINKED TO CONTENT IN NSP');print(message);feed+=message+'\n'			
+			message=('-----------------------------------');print(message);feed+=message+'\n'
 			totsnl=0
 			for file in self:
 				filename =  str(file._path)
 				if not filename in contentlist:
 					totsnl=totsnl+file.size
-					size_pr=sq_tools.getSize(file.size)						
-					Print.info(str(filename)+3*tab+"Size: "+size_pr)		
+					size_pr=sq_tools.getSize(file.size)		
+					message=(str(filename)+3*tab+"Size: "+size_pr);print(message);feed+=message+'\n'							
 			bigtab="\t"*7
-			size_pr=sq_tools.getSize(totsnl)					
-			Print.info(bigtab+"  --------------------")								
-			Print.info(bigtab+'  TOTAL SIZE: '+size_pr)		
-
+			size_pr=sq_tools.getSize(totsnl)		
+			message=(bigtab+"  --------------------");print(message);feed+=message+'\n'			
+			message=(bigtab+'  TOTAL SIZE: '+size_pr);print(message);feed+=message+'\n'		
+		return feed				
 
 #ADVANCED FILE-LIST			
 	def  adv_content_list(self):
+		feed=''
 		applist=list();	applist_ID=list()		
 		patchlist=list(); patchlist_ID=list()	
 		dlclist=list();	dlclist_ID=list()
@@ -1435,6 +1939,9 @@ class Nsp(Pfs0):
 							content_type_cnmt=content_type_cnmt[:-22]	
 							if content_type_cnmt == 'Application':
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)							
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'								
 								applist.append([target,titleid,version,tit_name,editor])
 							if content_type_cnmt == 'Patch':
 								patchlist.append([target,original_ID,version,titleid])
@@ -1455,51 +1962,145 @@ class Nsp(Pfs0):
 		if len(applist) != 0:
 			for i in range(len(applist)):		
 				tid=applist[i][1]		
-				Print.info('------------------------------------------------')
-				Print.info('BASE CONTENT ID: ' + str(tid))	
-				Print.info('------------------------------------------------')
-				Print.info('Name: '+applist[i][3])	
-				Print.info('Editor: '+applist[i][4])	
-				Print.info('------------------------------------------------')
-				print(applist[i][1]+" [BASE]"+" v"+applist[i][2])
+				message='------------------------------------------------';print(message);feed+=message+'\n'
+				message='BASE CONTENT ID: ' + str(tid);print(message);feed+=message+'\n'
+				message='------------------------------------------------';print(message);feed+=message+'\n'				
+				message='Name: '+applist[i][3];print(message);feed+=message+'\n'
+				message='Editor: '+applist[i][4];print(message);feed+=message+'\n'
+				message='------------------------------------------------';print(message);feed+=message+'\n'
+				message=applist[i][1]+" [BASE]"+" v"+applist[i][2];print(message);feed+=message+'\n'				
 				cupd=0
 				for j in range(len(patchlist)):
 					if tid == patchlist[j][1]:
 						v=patchlist[j][2]
 						v_number=str(int(int(v)/65536))
-						print(patchlist[j][3]+" [UPD]"+" v"+patchlist[j][2]+" -> Patch("+v_number+")")
+						message=patchlist[j][3]+" [UPD]"+" v"+patchlist[j][2]+" -> Patch("+v_number+")";print(message);feed+=message+'\n'								
 						cupd+=1
 						patch_called.append(patchlist[j])
 				cdlc=0					
 				for k in range(len(dlclist)):
 					if tid == dlclist[k][1]:
-						print(dlclist[k][3]+" [DLC "+str(dlclist[k][4])+"]"+" v"+dlclist[k][2])	
+						message=dlclist[k][3]+" [DLC "+str(dlclist[k][4])+"]"+" v"+dlclist[k][2];print(message);feed+=message+'\n'								
 						cdlc+=1		
-						dlc_called.append(dlclist[k])					
-				Print.info('------------------------------------------------')
-				Print.info('CONTENT INCLUDES: 1 BASEGAME '+str(cupd)+' UPDATES '+str(cdlc)+' DLCS')	
-				Print.info('------------------------------------------------')		
+						dlc_called.append(dlclist[k])	
+				message='------------------------------------------------';print(message);feed+=message+'\n'
+				message='CONTENT INCLUDES: 1 BASEGAME '+str(cupd)+' UPDATES '+str(cdlc)+' DLCS';print(message);feed+=message+'\n'				
+				message='------------------------------------------------';print(message);feed+=message+'\n'				
 				if len(patchlist) != len(patch_called):
-					Print.info('------------------------------------------------')
-					Print.info('ORPHANED UPDATES:')
-					Print.info('------------------------------------------------')	
+					message='------------------------------------------------';print(message);feed+=message+'\n'	
+					message='ORPHANED UPDATES:';print(message);feed+=message+'\n'						
+					message='------------------------------------------------';print(message);feed+=message+'\n'					
 					for j in range(len(patchlist)):	
 						if patchlist[j] not in patch_called:
 							v=patchlist[j][2]
 							v_number=str(int(int(v)/65536))
-							print(patchlist[j][3]+" [UPD]"+" v"+patchlist[j][2]+" -> Patch("+v_number+")")						
+							message=patchlist[j][3]+" [UPD]"+" v"+patchlist[j][2]+" -> Patch("+v_number+")";print(message);feed+=message+'\n'														
 				if len(dlclist) != len(dlc_called):
-					Print.info('------------------------------------------------')
-					Print.info('ORPHANED DLCS:')
-					Print.info('------------------------------------------------')	
+					message='------------------------------------------------';print(message);feed+=message+'\n'
+					message='ORPHANED DLCS:';print(message);feed+=message+'\n'					
+					message='------------------------------------------------';print(message);feed+=message+'\n'	
 					for k in range(len(dlclist)):	
 						if dlclist[k] not in dlc_called:
-							print(dlclist[k][3]+" [DLC "+str(dlclist[k][4])+"]"+" v"+dlclist[k][2])
-		else:		
-			print('This option is currently meant for multicontent, that includes at least a base game')
+							message=dlclist[k][3]+" [DLC "+str(dlclist[k][4])+"]"+" v"+dlclist[k][2];print(message);feed+=message+'\n'
+		else:	
+			message='This option is currently meant for multicontent, that includes at least a base game';print(message);feed+=message+'\n'
+		return feed		
+		
+#READ NACP FILE WITHOUT EXTRACTION	
+	def read_nacp(self,feed=''):
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.CONTROL':
+					offset=nca.get_nacp_offset()
+					for f in nca:
+						f.seek(offset)
+						nacp = Nacp()	
+						feed=nacp.par_getNameandPub(f.read(0x300*15),feed)
+						message='...............................';print(message);feed+=message+'\n'	
+						message='NACP FLAGS';print(message);feed+=message+'\n'						
+						message='...............................';print(message);feed+=message+'\n'
+						f.seek(offset+0x3000)							
+						feed=nacp.par_Isbn(f.read(0x24),feed)		
+						f.seek(offset+0x3025)							
+						feed=nacp.par_getStartupUserAccount(f.readInt8('little'),feed)	
+						feed=nacp.par_getUserAccountSwitchLock(f.readInt8('little'),feed)		
+						feed=nacp.par_getAddOnContentRegistrationType(f.readInt8('little'),feed)						
+						feed=nacp.par_getContentType(f.readInt8('little'),feed)	
+						feed=nacp.par_getParentalControl(f.readInt8('little'),feed)
+						feed=nacp.par_getScreenshot(f.readInt8('little'),feed)
+						feed=nacp.par_getVideoCapture(f.readInt8('little'),feed)
+						feed=nacp.par_dataLossConfirmation(f.readInt8('little'),feed)
+						feed=nacp.par_getPlayLogPolicy(f.readInt8('little'),feed)
+						feed=nacp.par_getPresenceGroupId(f.readInt64('little'),feed)
+						f.seek(offset+0x3040)
+						listages=list()
+						message='...............................';print(message);feed+=message+'\n'						
+						message='Age Ratings';print(message);feed+=message+'\n'	
+						message='...............................';print(message);feed+=message+'\n'						
+						for i in range(12):
+							feed=nacp.par_getRatingAge(f.readInt8('little'),i,feed)
+						f.seek(offset+0x3060)		
+						message='...............................';print(message);feed+=message+'\n'						
+						message='NACP ATTRIBUTES';print(message);feed+=message+'\n'	
+						message='...............................';print(message);feed+=message+'\n'							
+						try:
+							feed=nacp.par_getDisplayVersion(f.read(0xF),feed)		
+							f.seek(offset+0x3070)							
+							feed=nacp.par_getAddOnContentBaseId(f.readInt64('little'),feed)
+							f.seek(offset+0x3078)							
+							feed=nacp.par_getSaveDataOwnerId(f.readInt64('little'),feed)
+							f.seek(offset+0x3080)							
+							feed=nacp.par_getUserAccountSaveDataSize(f.readInt64('little'),feed)	
+							f.seek(offset+0x3088)								
+							feed=nacp.par_getUserAccountSaveDataJournalSize(f.readInt64('little'),feed)	
+							f.seek(offset+0x3090)	
+							feed=nacp.par_getDeviceSaveDataSize(f.readInt64('little'),feed)	
+							f.seek(offset+0x3098)	
+							feed=nacp.par_getDeviceSaveDataJournalSize(f.readInt64('little'),feed)	
+							f.seek(offset+0x30A0)	
+							feed=nacp.par_getBcatDeliveryCacheStorageSize(f.readInt64('little'),feed)		
+							f.seek(offset+0x30A8)	
+							feed=nacp.par_getApplicationErrorCodeCategory(f.read(0x07),feed)	
+							f.seek(offset+0x30B0)
+							feed=nacp.par_getLocalCommunicationId(f.readInt64('little'),feed)	
+							f.seek(offset+0x30F0)
+							feed=nacp.par_getLogoType(f.readInt8('little'),feed)							
+							feed=nacp.par_getLogoHandling(f.readInt8('little'),feed)		
+							feed=nacp.par_getRuntimeAddOnContentInstall(f.readInt8('little'),feed)	
+							feed=nacp.par_getCrashReport(f.readInt8('little'),feed)	
+							feed=nacp.par_getHdcp(f.readInt8('little'),feed)		
+							feed=nacp.par_getSeedForPseudoDeviceId(f.readInt64('little'),feed)	
+							f.seek(offset+0x3100)			
+							feed=nacp.par_getBcatPassphrase(f.read(0x40),feed)	
+							f.seek(offset+0x3148)			
+							feed=nacp.par_UserAccountSaveDataSizeMax(f.readInt64('little'),feed)						
+							f.seek(offset+0x3150)			
+							feed=nacp.par_UserAccountSaveDataJournalSizeMax(f.readInt64('little'),feed)
+							f.seek(offset+0x3158)			
+							feed=nacp.par_getDeviceSaveDataSizeMax(f.readInt64('little'),feed)
+							f.seek(offset+0x3160)			
+							feed=nacp.par_getDeviceSaveDataJournalSizeMax(f.readInt64('little'),feed)							
+							f.seek(offset+0x3168)			
+							feed=nacp.par_getTemporaryStorageSize(f.readInt64('little'),feed)		
+							feed=nacp.par_getCacheStorageSize(f.readInt64('little'),feed)			
+							f.seek(offset+0x3178)		
+							feed=nacp.par_getCacheStorageJournalSize(f.readInt64('little'),feed)							
+							feed=nacp.par_getCacheStorageDataAndJournalSizeMax(f.readInt64('little'),feed)		
+							f.seek(offset+0x3188)	
+							feed=nacp.par_getCacheStorageIndexMax(f.readInt64('little'),feed)		
+							feed=nacp.par_getPlayLogQueryableApplicationId(f.readInt64('little'),feed)		
+							f.seek(offset+0x3210)	
+							feed=nacp.par_getPlayLogQueryCapability(f.readInt8('little'),feed)	
+							feed=nacp.par_getRepair(f.readInt8('little'),feed)	
+							feed=nacp.par_getProgramIndex(f.readInt8('little'),feed)	
+							feed=nacp.par_getRequiredNetworkServiceLicenseOnLaunch(f.readInt8('little'),feed)	
+						except:continue	
+		return feed				
+
 		
 #READ CNMT FILE WITHOUT EXTRACTION	
 	def read_cnmt(self):
+		feed=''
 		for nca in self:
 			if type(nca) == Nca:
 				if 	str(nca.header.contentType) == 'Content.META':
@@ -1525,47 +2126,45 @@ class Nsp(Pfs0):
 							cnmt.seek(0x28)					
 							min_sversion=cnmt.readInt32()
 							length_of_emeta=cnmt.readInt32()	
-							Print.info('...........................................')								
-							Print.info('Reading: ' + str(cnmt._path))
-							Print.info('...........................................')							
-							Print.info('titleid = ' + str(hx(titleid.to_bytes(8, byteorder='big'))))
-							Print.info('version = ' + str(int.from_bytes(titleversion, byteorder='little')))
-							Print.info('Table offset = '+ str(hx((offset+0x20).to_bytes(2, byteorder='big'))))
-							Print.info('number of content = '+ str(content_entries))
-							Print.info('number of meta entries = '+ str(meta_entries))
-							Print.info('Application id\Patch id = ' + str(hx(original_ID.to_bytes(8, byteorder='big'))))
+							message='...........................................';print(message);feed+=message+'\n'	
+							message='Reading: ' + str(cnmt._path);print(message);feed+=message+'\n'							
+							message='...........................................';print(message);feed+=message+'\n'
+							message='Titleid = ' + (str(hx(titleid.to_bytes(8, byteorder='big')))[2:-1]).upper();print(message);feed+=message+'\n'							
+							message='Version = ' + str(int.from_bytes(titleversion, byteorder='little'));print(message);feed+=message+'\n'
+							message='Table offset = '+ str(hx((offset+0x20).to_bytes(2, byteorder='big')));print(message);feed+=message+'\n'
+							message='Number of content = '+ str(content_entries);print(message);feed+=message+'\n'
+							message='Number of meta entries = '+ str(meta_entries);print(message);feed+=message+'\n'
+							message='Application id\Patch id = ' + (str(hx(original_ID.to_bytes(8, byteorder='big')))[2:-1]).upper();print(message);feed+=message+'\n'							
 							content_name=str(cnmt._path)
 							content_name=content_name[:-22]				
 							if content_name == 'AddOnContent':
-								Print.info('RequiredUpdateNumber = ' + str(min_sversion))
+								message='RequiredUpdateNumber = ' + str(min_sversion);print(message);feed+=message+'\n'							
 							if content_name != 'AddOnContent':
-								Print.info('RequiredSystemVersion = ' + str(min_sversion))
-							Print.info('Length of exmeta = ' + str(length_of_emeta))								
+								message='RequiredSystemVersion = ' + str(min_sversion);print(message);feed+=message+'\n'	
+							message='Length of exmeta = ' + str(length_of_emeta);print(message);feed+=message+'\n'																
 							cnmt.rewind()
 							cnmt.seek(0x20+offset)
 							for i in range(content_entries):
-								Print.info('........................')							
-								Print.info('Content number ' + str(i+1))
-								Print.info('........................')
+								message='........................';print(message);feed+=message+'\n'		
+								message='Content number ' + str(i+1);print(message);feed+=message+'\n'																
+								message='........................';print(message);feed+=message+'\n'										
 								vhash = cnmt.read(0x20)
-								Print.info('hash =\t' + str(hx(vhash)))
+								message='Hash =\t' + str(hx(vhash));print(message);feed+=message+'\n'									
 								NcaId = cnmt.read(0x10)
-								Print.info('NcaId =\t' + str(hx(NcaId)))
+								message='NcaId =\t' + str(hx(NcaId));print(message);feed+=message+'\n'											
 								size = cnmt.read(0x6)
-								Print.info('Size =\t' + str(int.from_bytes(size, byteorder='little', signed=True)))
+								message='Size =\t' + str(int.from_bytes(size, byteorder='little', signed=True));print(message);feed+=message+'\n'								
 								ncatype = cnmt.read(0x1)
-								Print.info('ncatype = ' + str(int.from_bytes(ncatype, byteorder='little', signed=True)))
+								message='Ncatype = ' + str(int.from_bytes(ncatype, byteorder='little', signed=True));print(message);feed+=message+'\n'								
 								unknown = cnmt.read(0x1)	
 							cnmt.seek(0x20+offset+content_entries*0x38+length_of_emeta)			
 							digest = cnmt.read(0x20)
-							Print.info("")	
-							Print.info('digest= '+str(hx(digest)))
-							Print.info("")		
+							message='\ndigest= '+str(hx(digest))+'\n';print(message);feed+=message+'\n'									
 							cnmt.seek(0x20+offset+content_entries*0x38)										
 							if length_of_emeta>0:
-								Print.info('----------------')			
-								Print.info('Extended meta')	
-								Print.info('----------------')				
+								message='----------------';print(message);feed+=message+'\n'
+								message='Extended meta';print(message);feed+=message+'\n'								
+								message='----------------';print(message);feed+=message+'\n'											
 								num_prev_cnmt=cnmt.read(0x4)
 								num_prev_delta=cnmt.read(0x4)
 								num_delta_info=cnmt.read(0x4)
@@ -1573,16 +2172,15 @@ class Nsp(Pfs0):
 								num_previous_content=cnmt.read(0x4)		
 								num_delta_content=cnmt.read(0x4)	
 								cnmt.read(0x4)	
-								Print.info('Number of previous cnmt entries = ' + str(int.from_bytes(num_prev_cnmt, byteorder='little')))	
-								Print.info('Number of previous delta entries = ' + str(int.from_bytes(num_prev_delta, byteorder='little')))	
-								Print.info('Number of delta info entries = ' + str(int.from_bytes(num_delta_info, byteorder='little')))			
-								Print.info('Number of delta application info entries = ' + str(int.from_bytes(num_delta_application, byteorder='little')))	
-								Print.info('Number of previous content entries = ' + str(int.from_bytes(num_previous_content, byteorder='little')))	
-								Print.info('Number of delta content entries = ' + str(int.from_bytes(num_delta_content, byteorder='little')))		
+								message='Number of previous cnmt entries = ' + str(int.from_bytes(num_prev_cnmt, byteorder='little'));print(message);feed+=message+'\n'								
+								message='Number of previous delta entries = ' + str(int.from_bytes(num_prev_delta, byteorder='little'));print(message);feed+=message+'\n'									
+								message='Number of delta info entries = ' + str(int.from_bytes(num_delta_info, byteorder='little'));print(message);feed+=message+'\n'									
+								message='Number of previous content entries = ' + str(int.from_bytes(num_previous_content, byteorder='little'));print(message);feed+=message+'\n'	
+								message='Number of delta content entries = ' + str(int.from_bytes(num_delta_content, byteorder='little'));print(message);feed+=message+'\n'										
 								for i in range(int.from_bytes(num_prev_cnmt, byteorder='little')):
-									Print.info('...........................................')								
-									Print.info('Previous cnmt records: '+ str(i+1))
-									Print.info('...........................................')				
+									message='...........................................';print(message);feed+=message+'\n'									
+									message='Previous cnmt records: '+ str(i+1);print(message);feed+=message+'\n'		
+									message='...........................................';print(message);feed+=message+'\n'										
 									titleid=cnmt.readInt64()	
 									titleversion = cnmt.read(0x4)	
 									type_n = cnmt.read(0x1)					
@@ -1590,52 +2188,49 @@ class Nsp(Pfs0):
 									vhash = cnmt.read(0x20)
 									unknown2=cnmt.read(0x2)
 									unknown3=cnmt.read(0x2)
-									unknown4=cnmt.read(0x4)				
-									Print.info('titleid = ' + str(hx(titleid.to_bytes(8, byteorder='big'))))	
-									Print.info('version = ' + str(int.from_bytes(titleversion, byteorder='little')))
-									Print.info('type number = ' + str(hx(type_n)))	
-									#Print.info('unknown1 = ' + str(int.from_bytes(unknown1, byteorder='little')))			
-									Print.info('hash =\t' + str(hx(vhash)))				
-									Print.info('content nca number = ' + str(int.from_bytes(unknown2, byteorder='little')))				
-									#Print.info('unknown3 = ' + str(int.from_bytes(unknown3, byteorder='little')))				
-									#Print.info('unknown4 = ' + str(int.from_bytes(unknown4, byteorder='little')))
+									unknown4=cnmt.read(0x4)	
+									message='Titleid = ' + str(hx(titleid.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'
+									message='Version = ' + str(int.from_bytes(titleversion, byteorder='little'));print(message);feed+=message+'\n'	
+									message='Type number = ' + str(hx(type_n));print(message);feed+=message+'\n'	
+									message='Hash =\t' + str(hx(vhash));print(message);feed+=message+'\n'	
+									message='Content nca number = ' + str(int.from_bytes(unknown2, byteorder='little'));print(message);feed+=message+'\n'										
 								for i in range(int.from_bytes(num_prev_delta, byteorder='little')):
-									Print.info('...........................................')								
-									Print.info('Previous delta records: '+ str(i+1))
-									Print.info('...........................................')				
+									message='...........................................';print(message);feed+=message+'\n'	
+									message='Previous delta records: '+ str(i+1);print(message);feed+=message+'\n'										
+									message='...........................................';print(message);feed+=message+'\n'												
 									oldtitleid=cnmt.readInt64()	
 									newtitleid=cnmt.readInt64()					
 									oldtitleversion = cnmt.read(0x4)	
 									newtitleversion = cnmt.read(0x4)	
 									size = cnmt.read(0x8)
-									unknown1=cnmt.read(0x8)				
-									Print.info('old titleid = ' + str(hx(oldtitleid.to_bytes(8, byteorder='big'))))	
-									Print.info('new titleid = ' + str(hx(newtitleid.to_bytes(8, byteorder='big'))))						
-									Print.info('old version = ' + str(int.from_bytes(oldtitleversion, byteorder='little')))
-									Print.info('new version = ' + str(int.from_bytes(newtitleversion, byteorder='little')))	
-									Print.info('size = ' + str(int.from_bytes(size, byteorder='little', signed=True)))					
+									unknown1=cnmt.read(0x8)		
+									message='Old titleid = ' + str(hx(oldtitleid.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'	
+									message='New titleid = ' + str(hx(newtitleid.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'	
+									message='Old version = ' + str(int.from_bytes(oldtitleversion, byteorder='little'));print(message);feed+=message+'\n'	
+									message='New version = ' + str(int.from_bytes(newtitleversion, byteorder='little'));print(message);feed+=message+'\n'	
+									message='Size = ' + str(int.from_bytes(size, byteorder='little', signed=True));print(message);feed+=message+'\n'				
 									#Print.info('unknown1 = ' + str(int.from_bytes(unknown1, byteorder='little')))			
 								for i in range(int.from_bytes(num_delta_info, byteorder='little')):
-									Print.info('...........................................')								
-									Print.info('Delta info: '+ str(i+1))
-									Print.info('...........................................')				
+									message='...........................................';print(message);feed+=message+'\n'	
+									message='Delta info: '+ str(i+1);print(message);feed+=message+'\n'	
+									message='...........................................';print(message);feed+=message+'\n'										
 									oldtitleid=cnmt.readInt64()	
 									newtitleid=cnmt.readInt64()					
 									oldtitleversion = cnmt.read(0x4)	
 									newtitleversion = cnmt.read(0x4)	
 									index1=cnmt.readInt64()	
-									index2=cnmt.readInt64()				
-									Print.info('old titleid = ' + str(hx(oldtitleid.to_bytes(8, byteorder='big'))))	
-									Print.info('new titleid = ' + str(hx(newtitleid.to_bytes(8, byteorder='big'))))						
-									Print.info('old version = ' + str(int.from_bytes(oldtitleversion, byteorder='little')))
-									Print.info('new version = ' + str(int.from_bytes(newtitleversion, byteorder='little')))	
-									Print.info('index1 = ' + str(hx(index1.to_bytes(8, byteorder='big'))))	
-									Print.info('index2 = ' + str(hx(index2.to_bytes(8, byteorder='big'))))						
+									index2=cnmt.readInt64()		
+									message='Old titleid = ' + str(hx(oldtitleid.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'	
+									message='New titleid = ' + str(hx(newtitleid.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'	
+									message='Old version = ' + str(int.from_bytes(oldtitleversion, byteorder='little'));print(message);feed+=message+'\n'	
+									message='New version = ' + str(int.from_bytes(newtitleversion, byteorder='little'));print(message);feed+=message+'\n'	
+									message='Index1 = ' + str(hx(index1.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'
+									message='Index2 = ' + str(hx(index2.to_bytes(8, byteorder='big')));print(message);feed+=message+'\n'					
 									#Print.info('unknown1 = ' + str(int.from_bytes(unknown1, byteorder='little')))
 								for i in range(int.from_bytes(num_delta_application, byteorder='little')):
-									Print.info('...........................................')								
-									Print.info('Delta application info: '+ str(i+1))
-									Print.info('...........................................')				
+									message='...........................................';print(message);feed+=message+'\n'	
+									message='Delta application info: '+ str(i+1);print(message);feed+=message+'\n'	
+									message='...........................................';print(message);feed+=message+'\n'											
 									OldNcaId = cnmt.read(0x10)
 									NewNcaId = cnmt.read(0x10)		
 									old_size = cnmt.read(0x6)				
@@ -1644,45 +2239,42 @@ class Nsp(Pfs0):
 									unknown1 = cnmt.read(0x2)
 									ncatype = cnmt.read(0x1)	
 									installable = cnmt.read(0x1)
-									unknown2 = cnmt.read(0x4)				
-									Print.info('OldNcaId = ' + str(hx(OldNcaId)))	
-									Print.info('NewNcaId = ' + str(hx(NewNcaId)))	
-									Print.info('Old size = ' +  str(int.from_bytes(old_size, byteorder='little', signed=True)))	
-									Print.info('unknown1 = ' + str(int.from_bytes(unknown1, byteorder='little')))
-									Print.info('ncatype =  ' + str(int.from_bytes(ncatype, byteorder='little', signed=True)))
-									Print.info('installable = ' + str(int.from_bytes(installable, byteorder='little', signed=True)))
-									Print.info('Upper 2 bytes of the new size=' + str(hx(up2bytes)))	
-									Print.info('Lower 4 bytes of the new size=' + str(hx(low4bytes)))					
-									#Print.info('unknown2 =\t' + str(int.from_bytes(unknown2, byteorder='little')))			
-
+									unknown2 = cnmt.read(0x4)		
+									message='OldNcaId = ' + str(hx(OldNcaId));print(message);feed+=message+'\n'	
+									message='NewNcaId = ' + str(hx(NewNcaId));print(message);feed+=message+'\n'	
+									message='Old size = ' +  str(int.from_bytes(old_size, byteorder='little', signed=True));print(message);feed+=message+'\n'	
+									message='Unknown1 = ' + str(int.from_bytes(unknown1, byteorder='little'));print(message);feed+=message+'\n'	
+									message='Ncatype =  ' + str(int.from_bytes(ncatype, byteorder='little', signed=True));print(message);feed+=message+'\n'	
+									message='Installable = ' + str(int.from_bytes(installable, byteorder='little'));print(message);feed+=message+'\n'	
+									message='Upper 2 bytes of the new size=' + str(hx(up2bytes));print(message);feed+=message+'\n'	
+									message='Lower 4 bytes of the new size=' + str(hx(low4bytes));print(message);feed+=message+'\n'				
 								for i in range(int.from_bytes(num_previous_content, byteorder='little')):
-									Print.info('...........................................')								
-									Print.info('Previous content records: '+ str(i+1))
-									Print.info('...........................................')				
+									message='...........................................';print(message);feed+=message+'\n'	
+									message='Previous content records: '+ str(i+1);print(message);feed+=message+'\n'	
+									message='...........................................';print(message);feed+=message+'\n'	
 									NcaId = cnmt.read(0x10)		
 									size = cnmt.read(0x6)				
 									ncatype = cnmt.read(0x1)	
-									unknown1 = cnmt.read(0x1)				
-									Print.info('NcaId = '+ str(hx(NcaId)))	
-									Print.info('Size = '+ str(int.from_bytes(size, byteorder='little', signed=True)))	
-									Print.info('ncatype = '+ str(int.from_bytes(ncatype, byteorder='little', signed=True)))			
+									unknown1 = cnmt.read(0x1)	
+									message='NcaId = '+ str(hx(NcaId));print(message);feed+=message+'\n'	
+									message='Size = '+ str(int.from_bytes(size, byteorder='little', signed=True));print(message);feed+=message+'\n'	
+									message='Ncatype = '+ str(int.from_bytes(ncatype, byteorder='little', signed=True));print(message);feed+=message+'\n'											
 									#Print.info('unknown1 = '+ str(int.from_bytes(unknown1, byteorder='little')))	
-				
 								for i in range(int.from_bytes(num_delta_content, byteorder='little')):
-									Print.info('........................')							
-									Print.info('Delta content entry ' + str(i+1))
-									Print.info('........................')
+									message='...........................................';print(message);feed+=message+'\n'	
+									message='Delta content entry ' + str(i+1);print(message);feed+=message+'\n'	
+									message='...........................................';print(message);feed+=message+'\n'									
 									vhash = cnmt.read(0x20)
-									Print.info('hash =\t' + str(hx(vhash)))
+									message='Hash =\t' + str(hx(vhash));print(message);feed+=message+'\n'										
 									NcaId = cnmt.read(0x10)
-									Print.info('NcaId =\t' + str(hx(NcaId)))
+									message='NcaId =\t' + str(hx(NcaId));print(message);feed+=message+'\n'										
 									size = cnmt.read(0x6)
-									Print.info('Size =\t' + str(int.from_bytes(size, byteorder='little', signed=True)))
+									message='Size =\t' + str(int.from_bytes(size, byteorder='little', signed=True));print(message);feed+=message+'\n'									
 									ncatype = cnmt.read(0x1)
-									Print.info('ncatype = ' + str(int.from_bytes(ncatype, byteorder='little', signed=True)))
+									message='Ncatype = ' + str(int.from_bytes(ncatype, byteorder='little', signed=True));print(message);feed+=message+'\n'											
 									unknown = cnmt.read(0x1)	
-
-
+		return feed										
+		
 #READ CNMT FILE WITHOUT EXTRACTION	
 	def ret_xml(self,nca):
 		crypto1=nca.header.getCryptoType()
@@ -2375,7 +2967,28 @@ class Nsp(Pfs0):
 #///////////////////////////////////////////////////								
 #INFO ABOUT UPD REQUIREMENTS
 #///////////////////////////////////////////////////	
+	def getsdkvertit(self,titid):
+		programSDKversion=''
+		dataSDKversion=''
+		for nca in self:
+			if type(nca) == Nca:
+				nca_id=nca.header.titleId
+				if str(titid[:-3]).upper() == str(nca_id[:-3]).upper():
+					if 	str(nca.header.contentType) == 'Content.PROGRAM':
+						programSDKversion=nca.get_sdkversion()
+						break
+		if 	programSDKversion=='':				
+			for nca in self:
+				if type(nca) == Nca:
+					nca_id=nca.header.titleId
+					if str(titid[:-3]).upper() == str(nca_id[:-3]).upper():	
+						if 	str(nca.header.contentType) == 'Content.PUBLIC_DATA':
+							dataSDKversion = nca.get_sdkversion()
+							break		
+		return 	programSDKversion,dataSDKversion	
+		
 	def print_fw_req(self):
+		feed=''
 		for nca in self:
 			if type(nca) == Nca:
 				if 	str(nca.header.contentType) == 'Content.META':
@@ -2403,6 +3016,9 @@ class Nsp(Pfs0):
 								content_type='Update'
 								reqtag='- RequiredSystemVersion: '
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)							
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'						
 								if isdemo == 1:
 									content_type='Demo Update'
 								if isdemo == 2:
@@ -2414,7 +3030,10 @@ class Nsp(Pfs0):
 							if content_type_cnmt == 'Application':
 								content_type='Base Game or Application'
 								reqtag='- RequiredSystemVersion: '	
-								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)	
+								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'	
 								if isdemo == 1:
 									content_type='Demo'
 								if isdemo == 2:
@@ -2445,6 +3064,9 @@ class Nsp(Pfs0):
 								content_type='Update'
 								reqtag='- RequiredSystemVersion: '
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)							
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'									
 								if isdemo == 1:
 									content_type='Demo Update'
 								if isdemo == 2:
@@ -2457,52 +3079,60 @@ class Nsp(Pfs0):
 								content_type='Base Game or Application'
 								reqtag='- RequiredSystemVersion: '	
 								tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)	
+								if tit_name=='DLC':
+									tit_name='-'
+									editor='-'											
 								if isdemo == 1:
 									content_type='Demo'
 								if isdemo == 2:
-									content_type='RetailInteractiveDisplay'										
-							Print.info('-----------------------------')
-							Print.info('CONTENT ID: ' + str(titleid2))	
-							Print.info('-----------------------------')			
-							if content_type_cnmt != 'AddOnContent':									
-								Print.info("Titleinfo:")							
-								Print.info("- Name: " + tit_name)
-								Print.info("- Editor: " + editor)
-								Print.info("- Build number: " + str(ediver))
+									content_type='RetailInteractiveDisplay'	
+							programSDKversion,dataSDKversion=self.getsdkvertit(titleid2)										
+							sdkversion=nca.get_sdkversion()						
+							message=('-----------------------------');print(message);feed+=message+'\n'								
+							message=('CONTENT ID: ' + str(titleid2));print(message);feed+=message+'\n'	
+							message=('-----------------------------');print(message);feed+=message+'\n'				
+							if content_type_cnmt != 'AddOnContent':	
+								message=("Titleinfo:");print(message);feed+=message+'\n'								
+								message=("- Name: " + tit_name);print(message);feed+=message+'\n'								
+								message=("- Editor: " + editor);print(message);feed+=message+'\n'	
+								message=("- Build number: " + str(ediver));print(message);feed+=message+'\n'
+								message=("- Meta SDK version: " + sdkversion);print(message);feed+=message+'\n'
+								message=("- Program SDK version: " + programSDKversion);print(message);feed+=message+'\n'									
 								suplangue=str((', '.join(SupLg)))
-								Print.info("- Supported Languages: "+suplangue)
-								Print.info("- Content type: "+content_type)
-								Print.info("- Version: " + version+' -> '+content_type_cnmt+' ('+str(v_number)+')')									
+								message=("- Supported Languages: "+suplangue);print(message);feed+=message+'\n'									
+								message=("- Content type: "+content_type);print(message);feed+=message+'\n'									
+								message=("- Version: " + version+' -> '+content_type_cnmt+' ('+str(v_number)+')');print(message);feed+=message+'\n'																
 							if content_type_cnmt == 'AddOnContent':
-								Print.info("Titleinfo:")
+								message=("Titleinfo:");print(message);feed+=message+'\n'								
 								if tit_name != "DLC":
-									Print.info("- Name: " + tit_name)
-									Print.info("- Editor: " + editor)										
-								Print.info("- Content type: "+"DLC")
+									message=("- Name: " + tit_name);print(message);feed+=message+'\n'								
+									message=("- Editor: " + editor);print(message);feed+=message+'\n'
+								message=("- Content type: "+"DLC");print(message);feed+=message+'\n'							
 								DLCnumb=str(titleid2)
 								DLCnumb="0000000000000"+DLCnumb[-3:]									
 								DLCnumb=bytes.fromhex(DLCnumb)
 								DLCnumb=str(int.from_bytes(DLCnumb, byteorder='big'))									
 								DLCnumb=int(DLCnumb)
-								Print.info("- DLC number: "+str(DLCnumb)+' -> '+"AddOnContent"+' ('+str(DLCnumb)+')')					
-								Print.info("- DLC version Number: " + version+' -> '+"Version"+' ('+str(v_number)+')')
-							Print.info("")								
-							Print.info("Required Firmware:")			
+								message=("- DLC number: "+str(DLCnumb)+' -> '+"AddOnContent"+' ('+str(DLCnumb)+')');print(message);feed+=message+'\n'								
+								message=("- DLC version Number: " + version+' -> '+"Version"+' ('+str(v_number)+')');print(message);feed+=message+'\n'								
+								message=("- Meta SDK version: " + sdkversion);print(message);feed+=message+'\n'								
+								message=("- Data SDK version: " + dataSDKversion);print(message);feed+=message+'\n'															
+							message=("\nRequired Firmware:");print(message);feed+=message+'\n'								
 							if content_type_cnmt == 'AddOnContent':
 								if v_number == 0:
-									Print.info("- Required game version: " + str(RSversion)+' -> '+"Application"+' ('+str(RS_number)+')')									
+									message=("- Required game version: " + str(RSversion)+' -> '+"Application"+' ('+str(RS_number)+')');print(message);feed+=message+'\n'																	
 								if v_number > 0:
-									Print.info("- Required game version: " + str(RSversion)+' -> '+"Patch"+' ('+str(RS_number)+')')																									
+									message=("- Required game version: " + str(RSversion)+' -> '+"Patch"+' ('+str(RS_number)+')');print(message);feed+=message+'\n'																																																
 							else:
-								Print.info(reqtag + str(RSversion)+" -> " +RSV_rq)						
-							Print.info('- Encryption (keygeneration): ' + str(keygen)+" -> " +FW_rq)
-							if content_type_cnmt != 'AddOnContent':							
-								Print.info('- Patchable to: ' + str(MinRSV)+" -> " + RSV_rq_min)
+								message=(reqtag + str(RSversion)+" -> " +RSV_rq);print(message);feed+=message+'\n'	
+							message=('- Encryption (keygeneration): ' + str(keygen)+" -> " +FW_rq);print(message);feed+=message+'\n'								
+							if content_type_cnmt != 'AddOnContent':	
+								message=('- Patchable to: ' + str(MinRSV)+" -> " + RSV_rq_min);print(message);feed+=message+'\n'							
 							else:
-								Print.info('- Patchable to: DLC -> no RSV to patch')	
-							Print.info("")										
-							
-	def inf_get_title(self,target,offset,content_entries,original_ID):
+								message=('- Patchable to: DLC -> no RSV to patch\n');print(message);feed+=message+'\n'																
+		return feed
+		
+	def inf_get_title(self,target,offset,content_entries,original_ID,roman=True):
 		content_type=''
 		for nca in self:
 			if type(nca) == Nca:
@@ -2556,7 +3186,7 @@ class Nsp(Pfs0):
 			if type(nca) == Nca:
 				if nca_name == str(nca._path):
 					if 	str(nca.header.contentType) == 'Content.CONTROL':
-						title,editor,ediver,SupLg,regionstr,isdemo=nca.get_langueblock(title)
+						title,editor,ediver,SupLg,regionstr,isdemo=nca.get_langueblock(title,roman)
 						return(title,editor,ediver,SupLg,regionstr,isdemo)
 		regionstr="0|0|0|0|0|0|0|0|0|0|0|0|0|0"								
 		return(title,"","","",regionstr,"")							
@@ -2793,28 +3423,36 @@ class Nsp(Pfs0):
 # Change MKREV_NCA
 #///////////////////////////////////////////////////						
 		
-	def change_mkrev_nca(self, nca, newMasterKeyRev):
+	def change_mkrev_nca(self, nca, newMasterKeyRev,silent=False):
 	
 		indent = 2
 		tabs = '\t' * indent
 		indent2 = 3
 		tabs2 = '\t' * indent2
 		
-		masterKeyRev = nca.header.getCryptoType2()	
+		crypto1=nca.header.getCryptoType()
+		crypto2=nca.header.getCryptoType2()	
+		if crypto2>crypto1:
+			masterKeyRev=crypto2
+		if crypto2<=crypto1:	
+			masterKeyRev=crypto1		
 
 		if type(nca) == Nca:
 			if nca.header.getCryptoType2() != newMasterKeyRev:
-				Print.info(tabs + '-----------------------------------')
-				Print.info(tabs + 'Changing keygeneration from %d to %s' % ( nca.header.getCryptoType2(), str(newMasterKeyRev)))
-				Print.info(tabs + '-----------------------------------')
+				if silent == False:
+					Print.info(tabs + '-----------------------------------')
+					Print.info(tabs + 'Changing keygeneration from %d to %s' % ( nca.header.getCryptoType2(), str(newMasterKeyRev)))
+					Print.info(tabs + '-----------------------------------')
 				encKeyBlock = nca.header.getKeyBlock()
 				if sum(encKeyBlock) != 0:
 					key = Keys.keyAreaKey(Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex)
-					Print.info(tabs2 + '+ decrypting with %s (%d, %d)' % (str(hx(key)), Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex))
+					if silent == False:
+						Print.info(tabs2 + '+ decrypting with %s (%d, %d)' % (str(hx(key)), Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex))
 					crypto = aes128.AESECB(key)
 					decKeyBlock = crypto.decrypt(encKeyBlock)
 					key = Keys.keyAreaKey(Keys.getMasterKeyIndex(newMasterKeyRev), nca.header.keyIndex)
-					Print.info(tabs2 + '+ encrypting with %s (%d, %d)' % (str(hx(key)), Keys.getMasterKeyIndex(newMasterKeyRev), nca.header.keyIndex))
+					if silent == False:
+						Print.info(tabs2 + '+ encrypting with %s (%d, %d)' % (str(hx(key)), Keys.getMasterKeyIndex(newMasterKeyRev), nca.header.keyIndex))
 					crypto = aes128.AESECB(key)
 					reEncKeyBlock = crypto.encrypt(decKeyBlock)
 					nca.header.setKeyBlock(reEncKeyBlock)
@@ -2826,8 +3464,9 @@ class Nsp(Pfs0):
 					nca.header.setCryptoType2(0)					
 				if newMasterKeyRev < 2:
 					nca.header.setCryptoType(newMasterKeyRev)
-					nca.header.setCryptoType2(0)	
-				Print.info(tabs2 + 'DONE')		
+					nca.header.setCryptoType2(0)
+				if silent == False:	
+					Print.info(tabs2 + 'DONE')		
 
 #///////////////////////////////////////////////////								
 #PATCH META FUNCTION
@@ -2912,7 +3551,7 @@ class Nsp(Pfs0):
 			'''	
 								
 								
-	def get_title(self,baseid):
+	def get_title(self,baseid,roman=True):
 		for nca in self:
 			if type(nca) == Nca:	
 				if 	str(nca.header.contentType) == 'Content.META':
@@ -2952,7 +3591,7 @@ class Nsp(Pfs0):
 		for nca in self:
 			if type(nca) == Nca:
 				if 	str(nca.header.contentType) == 'Content.CONTROL':
-					title,editor,ediver,SupLg,regionstr,isdemo=nca.get_langueblock(title)
+					title,editor,ediver,SupLg,regionstr,isdemo=nca.get_langueblock(title,roman)
 					return(title)							
 					
 	def get_lang_tag(self,baseid):
@@ -3005,7 +3644,7 @@ class Nsp(Pfs0):
 					if "DE" in SupLg:
 						languetag=languetag+'De,'							
 					if ("LAT (spa)" and "SPA") in SupLg:
-						languetag=languetag+'Es'
+						languetag=languetag+'Es,'
 					elif "LAT (spa)" in SupLg:
 						languetag=languetag+'LatEs,'
 					elif "SPA" in SupLg:
@@ -3091,6 +3730,7 @@ class Nsp(Pfs0):
 		for file in self:
 			if type(file) == Ticket:		
 				masterKeyRev = file.getMasterKeyRevision()
+				ticket=file
 				titleKeyDec = Keys.decryptTitleKey(file.getTitleKeyBlock().to_bytes(16, byteorder='big'), Keys.getMasterKeyIndex(masterKeyRev))
 				rightsId = file.getRightsId()
 		for nca in self:
@@ -3286,7 +3926,9 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(newheader))>block:
 							n2=block-c
 							c=0
-							dat2=newheader[0x00:0x00+int(n2)]
+							inmemoryfile = io.BytesIO(newheader)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -3295,7 +3937,9 @@ class Nsp(Pfs0):
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
 							outf = open(outfile, 'wb')	
-							dat2=newheader[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(newheader)-n2)
+							inmemoryfile.close()
 							outf.write(dat2)						
 							t.update(len(dat2))									
 							outf.flush()	
@@ -3306,14 +3950,13 @@ class Nsp(Pfs0):
 						nca.seek(0xC00)									
 						i+=1							
 					else:
-						outf.write(data)				
-						t.update(len(data))
-						c=c+len(data)									
-						outf.flush()
 						if fat=="fat32" and (c+len(data))>block:
 							n2=block-c
 							c=0
-							dat2=nca.read(int(n2))
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -3321,7 +3964,18 @@ class Nsp(Pfs0):
 							index=index+1
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
-							outf = open(outfile, 'wb')							
+							outf = open(outfile, 'wb')					
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
+							outf.write(dat2)						
+							t.update(len(dat2))									
+							outf.flush()	
+						else:
+							outf.write(data)				
+							t.update(len(data))
+							c=c+len(data)									
+							outf.flush()						
 						if not data:
 							break
 			if type(nca) == Nca and str(nca.header.contentType) == 'Content.META':	
@@ -3333,14 +3987,13 @@ class Nsp(Pfs0):
 				size=os.path.getsize(filepath)
 				t.write(tabs+'- Appending: ' + str(nca._path))						
 				for data in iter(lambda: target.read(int(size)), ""):				
-					outf.write(data)
-					t.update(len(data))
-					c=c+len(data)
-					outf.flush()
 					if fat=="fat32" and (c+len(data))>block:
 						n2=block-c
 						c=0
-						dat2=nca.read(int(n2))
+						inmemoryfile = io.BytesIO()
+						inmemoryfile.write(data)
+						inmemoryfile.seek(0)
+						dat2=inmemoryfile.read(n2)
 						outf.write(dat2)
 						outf.flush()
 						outf.close()	
@@ -3348,12 +4001,18 @@ class Nsp(Pfs0):
 						index=index+1
 						outfile=outfile[0:-1]
 						outfile=outfile+str(index)
-						outf = open(outfile, 'wb')
-						if totSize>(4294934528+int(buffer)):
-							dat2=nca.read(int(buffer))
-							outf.write(dat2)						
-							t.update(len(dat2))									
-							outf.flush()	
+						outf = open(outfile, 'wb')					
+						inmemoryfile.seek(n2)
+						dat2=inmemoryfile.read(len(data)-n2)
+						inmemoryfile.close()
+						outf.write(dat2)						
+						t.update(len(dat2))									
+						outf.flush()	
+					else:
+						outf.write(data)
+						t.update(len(data))
+						c=c+len(data)
+						outf.flush()					
 					if not data:
 						target.close()
 						break	
@@ -3368,14 +4027,13 @@ class Nsp(Pfs0):
 					t.write(tabs+'- Appending: ' + xmlname)
 					xmlf.seek(0x00)
 					for data in iter(lambda: xmlf.read(int(buffer)), ""):				
-						outf.write(data)
-						t.update(len(data))
-						c=c+len(data)
-						outf.flush()
 						if fat=="fat32" and (c+len(data))>block:
 							n2=block-c
 							c=0
-							dat2=nca.read(int(n2))
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -3383,12 +4041,18 @@ class Nsp(Pfs0):
 							index=index+1
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
-							outf = open(outfile, 'wb')
-							if totSize>(4294934528+int(buffer)):
-								dat2=nca.read(int(buffer))
-								outf.write(dat2)						
-								t.update(len(dat2))									
-								outf.flush()	
+							outf = open(outfile, 'wb')					
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
+							outf.write(dat2)						
+							t.update(len(dat2))									
+							outf.flush()	
+						else:
+							outf.write(data)
+							t.update(len(data))
+							c=c+len(data)
+							outf.flush()	
 						if not data:
 							xmlf.close()
 							break	
@@ -3400,11 +4064,11 @@ class Nsp(Pfs0):
 		print("")
 		print("Closing file. Please wait")		
 		outf.close()				
-				
+
 #///////////////////////////////////////////////////								
 #ADD TO DATABASE
 #///////////////////////////////////////////////////					
-	def addtodb(self,ofile,dbtype):		
+	def addtodb(self,ofile,dbtype,roman=True):		
 		for nca in self:
 			if type(nca) == Nca:	
 				if 	str(nca.header.contentType) == 'Content.META':
@@ -3441,7 +4105,9 @@ class Nsp(Pfs0):
 								else:			
 									keygen=nca.header.getCryptoType2()	
 							else:			
-								keygen=nca.header.getCryptoType2()								
+								keygen=nca.header.getCryptoType2()
+							sdkversion=nca.get_sdkversion()			
+							programSDKversion,dataSDKversion=self.getsdkvertit(titleid2)							
 							MinRSV=sq_tools.getMinRSV(keygen,min_sversion)
 							RSV_rq=sq_tools.getFWRangeRSV(min_sversion)						
 							length_of_emeta=cnmt.readInt32()	
@@ -3450,13 +4116,18 @@ class Nsp(Pfs0):
 							if ckey == '0':
 								ckey=self.getdbkey(titlerights)
 							target=str(nca._path)
-							tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)
+							tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID,roman)
+							if tit_name=='DLC' and (str(titlerights).endswith('000') or str(titlerights).endswith('800')):
+								tit_name='-'
+								editor='-'
 							if dbtype == 'extended' or dbtype == 'all':
-								dbstring=self.getdbstr(titleid2,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq[1:-1],RS_number,MinRSV,regionstr,ediver,editor,isdemo)
+								dbstring=self.getdbstr(titleid2,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq[1:-1],RS_number,MinRSV,regionstr,ediver,editor,isdemo,sdkversion,programSDKversion,dataSDKversion)
 							if dbtype == 'keyless' or dbtype == 'all':
-								kdbstring=self.getkeylessdbstr(titleid2,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq[1:-1],RS_number,MinRSV,regionstr,ediver,editor,isdemo)
+								kdbstring=self.getkeylessdbstr(titleid2,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq[1:-1],RS_number,MinRSV,regionstr,ediver,editor,isdemo,sdkversion,programSDKversion,dataSDKversion)
 							if dbtype == 'nutdb' or dbtype == 'all':	
 								ndbstring=self.getnutdbstr(titleid2,titlerights,ckey,content_type,tit_name,version,regionstr,isdemo)
+							if dbtype == 'simple' or dbtype == 'all':								
+								simplbstr=self.simplbstr(titlerights,ckey,tit_name)
 							print ("- Processing: "+ str(self._path))
 							print("")
 							if dbtype == 'extended':
@@ -3467,7 +4138,10 @@ class Nsp(Pfs0):
 								self.appendtodb(kdbstring,ofile,dbtype)	
 							if dbtype == 'nutdb':
 								print("NUTDB DB STRING:")									
-								self.appendtodb(ndbstring,ofile,dbtype)		
+								self.appendtodb(ndbstring,ofile,dbtype)	
+							if dbtype == 'simple':
+								print("SIMPLE DB STRING:")									
+								self.appendtodb(simplbstr,ofile,dbtype)										
 							if dbtype == 'all':		
 								dir=os.path.dirname(os.path.abspath(ofile))	
 								edbf='extended_DB.txt'	
@@ -3476,6 +4150,8 @@ class Nsp(Pfs0):
 								ndbf = os.path.join(dir, ndbf)	
 								kdbfile='keyless_DB.txt'	
 								kdbfile = os.path.join(dir, kdbfile)
+								simpbfile='simple_DB.txt'	
+								simpbfile = os.path.join(dir, simpbfile)								
 								print("EXTENDED DB STRING:")
 								self.appendtodb(dbstring,edbf,"extended")
 								print("")
@@ -3483,7 +4159,10 @@ class Nsp(Pfs0):
 								self.appendtodb(kdbstring,kdbfile,"keyless")
 								print("")
 								print("NUTDB DB STRING:")								
-								self.appendtodb(ndbstring,ndbf,"nutdb")										
+								self.appendtodb(ndbstring,ndbf,"nutdb")		
+								print("")
+								print("SIMPLE DB STRING:")								
+								self.appendtodb(simplbstr,simpbfile,"simple")										
 							print("")
 
 						
@@ -3491,9 +4170,12 @@ class Nsp(Pfs0):
 		titleKeyDec='0'
 		nca_id=''
 		self.rewind()
+		tr=''
 		for nca in self:
-			if type(nca) == Nca:	
-				if nca.header.getRightsId() != 0:		
+			if type(nca) == Nca:		
+				if nca.header.getRightsId() != 0:
+					crypto1=nca.header.getCryptoType()
+					crypto2=nca.header.getCryptoType2()								
 					nca_id=nca.header.titleId
 					nca_id=nca_id.lower()
 					if original_ID==nca_id:
@@ -3509,26 +4191,60 @@ class Nsp(Pfs0):
 					else:
 						tr=str(nca.header.rightsId)
 						tr = tr[2:-1]	
-						return tr,titleKeyDec									
-				if nca.header.getRightsId() == 0:								
-					if	nca.header.getgamecard() == 0:				
-						crypto1=nca.header.getCryptoType()
-						crypto2=nca.header.getCryptoType2()		
-						if crypto1>crypto2:
-							masterKeyRev = crypto1
+						return tr,titleKeyDec																				
+				if nca.header.getRightsId() == 0:	
+					crypto1=nca.header.getCryptoType()
+					crypto2=nca.header.getCryptoType2()		
+					nca_id=nca.header.titleId
+					nca_id=nca_id.lower()			
+					if original_ID==nca_id:								
+						if	nca.header.getgamecard() == 0:					
+							if crypto1>crypto2:
+								masterKeyRev = crypto1
+							else:
+								masterKeyRev = crypto2		
+							key = Keys.keyAreaKey(Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex)
+							crypto = aes128.AESECB(key)							
+							KB1L=nca.header.getKB1L()
+							KB1L = crypto.decrypt(KB1L)
+							if sum(KB1L) != 0:		
+								encKeyBlock = nca.header.getKeyBlock()							
+								decKeyBlock = crypto.decrypt(encKeyBlock[:16])							
+								titleKeyDec = hx(Keys.encryptTitleKey(decKeyBlock, Keys.getMasterKeyIndex(masterKeyRev)))
+								titleKeyDec=str(titleKeyDec)[2:-1]
+								tr=cnmt_id+'000000000000000'+str(crypto2)
+								check=tr[:16]										
+								if check.endswith('000') and content_type=='Application':							
+									return tr,titleKeyDec
+								if check.endswith('800') and content_type=='Patch':								
+									return tr,titleKeyDec
+					elif cnmt_id==nca_id:								
+						if	nca.header.getgamecard() == 0:					
+							if crypto1>crypto2:
+								masterKeyRev = crypto1
+							else:
+								masterKeyRev = crypto2		
+							key = Keys.keyAreaKey(Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex)
+							crypto = aes128.AESECB(key)							
+							KB1L=nca.header.getKB1L()
+							KB1L = crypto.decrypt(KB1L)
+							if sum(KB1L) != 0:		
+								encKeyBlock = nca.header.getKeyBlock()							
+								decKeyBlock = crypto.decrypt(encKeyBlock[:16])							
+								titleKeyDec = hx(Keys.encryptTitleKey(decKeyBlock, Keys.getMasterKeyIndex(masterKeyRev)))
+								titleKeyDec=str(titleKeyDec)[2:-1]
+								tr=cnmt_id+'000000000000000'+str(crypto2)
+								check=tr[:16]
+								if not check.endswith('000') and not tr.endswith('800') and content_type=='AddOnContent':								
+									return tr,titleKeyDec										
+							else:
+								tr=cnmt_id+'000000000000000'+str(crypto2)	
 						else:
-							masterKeyRev = crypto2		
-						key = Keys.keyAreaKey(Keys.getMasterKeyIndex(masterKeyRev), nca.header.keyIndex)
-						crypto = aes128.AESECB(key)							
-						KB1L=nca.header.getKB1L()
-						KB1L = crypto.decrypt(KB1L)
-						if sum(KB1L) != 0:		
-							encKeyBlock = nca.header.getKeyBlock()							
-							decKeyBlock = crypto.decrypt(encKeyBlock[:16])							
-							titleKeyDec = hx(Keys.encryptTitleKey(decKeyBlock, Keys.getMasterKeyIndex(masterKeyRev)))
-							titleKeyDec=str(titleKeyDec)[2:-1]
-							tr=cnmt_id+'000000000000000'+str(crypto2)
-							return tr,titleKeyDec						
+							tr=cnmt_id+'000000000000000'+str(crypto2)	
+		if tr=='':								
+			tr=cnmt_id+'000000000000000'+str(crypto2)									
+		titleKeyDec='00000000000000000000000000000000'				
+		return tr,titleKeyDec			
 								
 	def getdbkey(self,titlerights):	
 		for ticket in self:		
@@ -3541,7 +4257,7 @@ class Nsp(Pfs0):
 					titleKey=titleKey[2:-1]
 					return str(titleKey)
 
-	def getdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq,RS_number,MinRSV,regionstr,ediver,editor,isdemo):	
+	def getdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq,RS_number,MinRSV,regionstr,ediver,editor,isdemo,sdkversion,programSDKversion,dataSDKversion):	
 		dbstr=str()
 		dbstr+=str(titleid).upper()+'|'
 		dbstr+=str(titlerights).upper()+'|'
@@ -3591,11 +4307,16 @@ class Nsp(Pfs0):
 		dbstr+=str(tit_name)+'|'
 		dbstr+=str(editor)+'|'		
 		dbstr+=str(version)+'|'	
-		dbstr+=str(ediver)+'|'		
-		dbstr+=regionstr	
+		dbstr+=str(ediver)+'|'	
+		dbstr+=sdkversion+'|'		
+		if content_type!='AddOnContent':
+			dbstr+=programSDKversion+'|'		
+		else:
+			dbstr+=dataSDKversion+'|'				
+		dbstr+=regionstr		
 		return dbstr
 		
-	def getkeylessdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq,RS_number,MinRSV,regionstr,ediver,editor,isdemo):	
+	def getkeylessdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,crypto1,crypto2,keygen,min_sversion,RSV_rq,RS_number,MinRSV,regionstr,ediver,editor,isdemo,sdkversion,programSDKversion,dataSDKversion):	
 		dbstr=str()
 		dbstr+=str(titleid).upper()+'|'
 		dbstr+=str(titlerights).upper()+'|'
@@ -3644,11 +4365,16 @@ class Nsp(Pfs0):
 		dbstr+=str(tit_name)+'|'
 		dbstr+=str(editor)+'|'		
 		dbstr+=str(version)+'|'	
-		dbstr+=str(ediver)+'|'		
+		dbstr+=str(ediver)+'|'	
+		dbstr+=sdkversion+'|'		
+		if content_type!='AddOnContent':
+			dbstr+=programSDKversion+'|'		
+		else:
+			dbstr+=dataSDKversion+'|'				
 		dbstr+=regionstr	
 		return dbstr		
 
-	def getnutdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,regionstr,isdemo):	
+	def getnutdbstr(self,titleid,titlerights,ckey,content_type,tit_name,version,regionstr,isdemo,):	
 		dbstr=str()
 		dbstr+=str(titleid).upper()+'|'
 		dbstr+=str(titlerights).upper()+'|'
@@ -3693,15 +4419,24 @@ class Nsp(Pfs0):
 		else:
 			Regionvar="-"		
 		dbstr+=Regionvar	
-		return dbstr	
+		return dbstr
+
+	def simplbstr(self,titlerights,ckey,tit_name):	
+		dbstr=str()
+		dbstr+=str(titlerights).upper()+'|'
+		dbstr+=str(ckey).upper()+'|'	
+		dbstr+=str(tit_name)
+		return dbstr			
 
 	def appendtodb(self,dbstring,ofile,dbtype):
 		if dbtype == 'extended':
-			initdb='id|rightsId|keygeneration|RSV|RGV|key|ContentType|baseName|editor|version|cversion|us|uk|jp|fr|de|lat|spa|it|du|cad|por|ru|kor|tai|ch'	
+			initdb='id|rightsId|keygeneration|RSV|RGV|key|ContentType|baseName|editor|version|cversion|metasdkversion|exesdkversion|us|uk|jp|fr|de|lat|spa|it|du|cad|por|ru|kor|tai|ch'	
 		if dbtype == 'keyless':
-			initdb='id|rightsId|keygeneration|RSV|RGV|ContentType|baseName|editor|version|cversion|us|uk|jp|fr|de|lat|spa|it|du|cad|por|ru|kor|tai|ch'		
+			initdb='id|rightsId|keygeneration|RSV|RGV|ContentType|baseName|editor|version|cversion|metasdkversion|exesdkversion|us|uk|jp|fr|de|lat|spa|it|du|cad|por|ru|kor|tai|ch'		
 		if dbtype == 'nutdb':
-			initdb='id|rightsId|key|isUpdate|isDLC|isDemo|baseName|name|version|region'		
+			initdb='id|rightsId|key|isUpdate|isDLC|isDemo|baseName|name|version|region'	
+		if dbtype == 'simple':
+			initdb='rightsId|key|name'					
 		if not os.path.exists(ofile):
 			with open(ofile, 'a') as dbfile:			
 				dbfile.write(initdb+ '\n')
@@ -3883,7 +4618,9 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(newheader))>block:
 							n2=block-c
 							c=0
-							dat2=newheader[0x00:0x00+int(n2)]
+							inmemoryfile = io.BytesIO(newheader)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -3892,25 +4629,26 @@ class Nsp(Pfs0):
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
 							outf = open(outfile, 'wb')	
-							dat2=newheader[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(newheader)-n2)
+							inmemoryfile.close()
 							outf.write(dat2)						
 							t.update(len(dat2))									
 							outf.flush()	
 						else:
 							outf.write(newheader)
 							t.update(len(newheader))	
-							c=c+len(newheader)								
+							c=c+len(newheader)									
 						nca.seek(0xC00)									
 						i+=1		
 					else:			
-						outf.write(data)
-						t.update(len(data))
-						c=c+len(data)
-						outf.flush()
 						if fat=="fat32" and (c+len(data))>block:
 							n2=block-c
 							c=0
-							dat2=nca.read(int(n2))
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -3918,12 +4656,18 @@ class Nsp(Pfs0):
 							index=index+1
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
-							outf = open(outfile, 'wb')
-							if totSize>(4294934528+int(buffer)):
-								dat2=nca.read(int(buffer))
-								outf.write(dat2)						
-								t.update(len(dat2))									
-								outf.flush()	
+							outf = open(outfile, 'wb')					
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
+							outf.write(dat2)						
+							t.update(len(dat2))									
+							outf.flush()	
+						else:
+							outf.write(data)				
+							t.update(len(data))
+							c=c+len(data)									
+							outf.flush()
 						if not data:
 							break
 			if type(nca) == Nca and str(nca.header.contentType) == 'Content.META':	
@@ -3994,14 +4738,13 @@ class Nsp(Pfs0):
 				size=os.path.getsize(filepath)
 				t.write(tabs+'- Appending: ' + str(nca._path))						
 				for data in iter(lambda: target.read(int(size)), ""):				
-					outf.write(data)
-					t.update(len(data))
-					c=c+len(data)
-					outf.flush()
 					if fat=="fat32" and (c+len(data))>block:
 						n2=block-c
 						c=0
-						dat2=nca.read(int(n2))
+						inmemoryfile = io.BytesIO()
+						inmemoryfile.write(data)
+						inmemoryfile.seek(0)
+						dat2=inmemoryfile.read(n2)
 						outf.write(dat2)
 						outf.flush()
 						outf.close()	
@@ -4009,12 +4752,18 @@ class Nsp(Pfs0):
 						index=index+1
 						outfile=outfile[0:-1]
 						outfile=outfile+str(index)
-						outf = open(outfile, 'wb')
-						if totSize>(4294934528+int(buffer)):
-							dat2=nca.read(int(buffer))
-							outf.write(dat2)						
-							t.update(len(dat2))									
-							outf.flush()	
+						outf = open(outfile, 'wb')					
+						inmemoryfile.seek(n2)
+						dat2=inmemoryfile.read(len(data)-n2)
+						inmemoryfile.close()
+						outf.write(dat2)						
+						t.update(len(dat2))									
+						outf.flush()	
+					else:
+						outf.write(data)
+						t.update(len(data))
+						c=c+len(data)
+						outf.flush()
 					if not data:
 						target.close()
 						break	
@@ -4371,8 +5120,211 @@ class Nsp(Pfs0):
 		header += encKeyBlock
 		header += rawhead[0x340:]
 		newheader=hcrypto.encrypt(header)
-		return newheader		
+		return newheader			
+
+	def rebuild(self,buffer,filepath,delta,ndskip,xml_gen):	
+		ofolder=os.path.dirname(os.path.abspath(filepath))	
+		if ndskip==True:
+			vfragment=False	
+			for nca in self:
+				if type(nca) == Nca:
+					if 	str(nca.header.contentType) == 'Content.DATA':
+						try:
+							for f in nca:
+									for file in f:
+										filename = str(file._path)
+										if filename=="fragment":
+											vfragment=True
+											break	
+						except:
+							pass
+			if vfragment != True:
+				print("> File doesn't have deltas. Skipping")
+				return				
+		contentlist=list()
+		ncalist=list()
+		completefilelist=list()
+		xmlsize=0
+		self.rewind()
+		for file in self:
+			completefilelist.append(str(file._path))
+		self.rewind()		
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.META':
+					for f in nca:
+						for cnmt in f:
+							nca.rewind()
+							f.rewind()
+							cnmt.rewind()						
+							titleid=cnmt.readInt64()
+							titleversion = cnmt.read(0x4)
+							cnmt.rewind()
+							cnmt.seek(0xE)
+							offset=cnmt.readInt16()
+							content_entries=cnmt.readInt16()
+							meta_entries=cnmt.readInt16()
+							content_type=str(cnmt._path)
+							content_type=content_type[:-22]	
+							titleid2 = str(hx(titleid.to_bytes(8, byteorder='big'))) 	
+							titleid2 = titleid2[2:-1]	
+							cnmt.seek(0x20)
+							if content_type=='Application':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								ttag=''
+								CTYPE='BASE'					
+							elif content_type=='Patch':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								ttag=' [UPD]'
+								CTYPE='UPDATE'
+							elif content_type=='AddOnContent':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								ttag=' [DLC]'
+								CTYPE='DLC'									
+							else: 
+								print(titleid2+' is not an update. Skipping')
+								continue					
+							cnmt.seek(0x20+offset)			
+							for i in range(content_entries):
+								vhash = cnmt.read(0x20)
+								NcaId = cnmt.read(0x10)
+								size = cnmt.read(0x6)
+								ncatype = cnmt.readInt8()
+								unknown = cnmt.read(0x1)							
+							#**************************************************************	
+								version=str(int.from_bytes(titleversion, byteorder='little'))
+								version='[v'+version+']'
+								titleid3 ='['+ titleid2+']'
+								nca_name=str(hx(NcaId))
+								nca_name=nca_name[2:-1]+'.nca'							
+								if nca_name in completefilelist:
+									if ncatype==6 and delta==False:	
+										print('Skipping delta fragment '+nca_name)
+										continue	
+									else:		
+										contentlist.append(nca_name)			
+							nca_meta=str(nca._path)
+							if nca_meta in completefilelist:	
+								contentlist.append(nca_meta)
+								if xml_gen == True:
+									target = Fs.Nca(nca, 'r+b')
+									target.rewind()		
+									outf= os.path.join(ofolder, str(nca._path))									
+									fp = open(outf, 'w+b')		
+									for data in iter(lambda: target.read(int(32768)), ""):	
+										fp.write(data)						
+										fp.flush()				
+										if not data:
+											fp.close()									
+											break			
+									target = Fs.Nca(outf, 'r+b')										
+									block = target.read()			
+									nsha=sha256(block).hexdigest()	
+									target.rewind()	
+									xml=target.xml_gen(ofolder,nsha)									
+									xmlname=nca_meta[:-3]+'xml'
+									xmlsize=xmlsize+os.path.getsize(xml)
+									contentlist.append(xmlname)									
+									target.close()
+									try:
+										os.remove(outf) 	
+									except:
+										pass			
+							for f in completefilelist:
+								if f.endswith('.tik') or f.endswith('.cert'):
+									test=f[0:16]								
+									if titleid2==test:
+										contentlist.append(f)
+		
+		filesNb = len(contentlist)
+		stringTable = '\x00'.join(str(file) for file in contentlist)
+		headerSize = 0x10 + (filesNb)*0x18 + len(stringTable)
+		remainder = 0x10 - headerSize%0x10
+		headerSize += remainder
+
+		fileSizes = list()				
+		self.rewind()
+		for f in contentlist:	
+			if not f.endswith('.xml'):
+				for file in self:	
+					if file._path==f:			
+						fileSizes.append(file.size)	
+			elif f.endswith('.xml'):						
+				xmlfile= os.path.join(ofolder, f)
+				fileSizes.append(os.path.getsize(xmlfile))					
+		fileOffsets = [sum(fileSizes[:n]) for n in range(filesNb)]
+		fileNamesLengths = [len(str(file))+1 for file in contentlist] # +1 for the \x00
+		stringTableOffsets = [sum(fileNamesLengths[:n]) for n in range(filesNb)]
+		
+		hd =  b''
+		hd += b'PFS0'
+		hd += pk('<I', filesNb)
+		hd += pk('<I', len(stringTable)+remainder)
+		hd += b'\x00\x00\x00\x00'
+		for n in range(filesNb):
+			hd += pk('<Q', fileOffsets[n])
+			hd += pk('<Q', fileSizes[n])
+			hd += pk('<I', stringTableOffsets[n])
+			hd += b'\x00\x00\x00\x00'
+		hd += stringTable.encode()
+		hd += remainder * b'\x00'
+
+		totSize = len(hd)+xmlsize 
+		for f in contentlist:	
+			if not f.endswith('.xml'):
+				for file in self:	
+					if file._path==f:			
+						totSize=totSize+file.size	
+
+		indent = 1
+		rightsId = 0
+		tabs = '\t' * indent
+
+		Print.info("")
+		Print.info('Generating NSP:')	
+		Print.info('Filename: '+filepath)	
+		t = tqdm(total=totSize, unit='B', unit_scale=True, leave=False)		
+		t.write(tabs+'- Writing header...')	
+		outf = open(str(filepath), 'w+b')	
+		outf.write(hd)			
+		t.update(len(hd))
+		for f in contentlist:
+			if not f.endswith('.xml'):		
+				for file in self:
+					if file._path==f:
+						file.rewind()			
+						t.write(tabs+'- Appending: ' + str(file._path))					
+						for data in iter(lambda: file.read(int(buffer)), ""):				
+							outf.write(data)
+							t.update(len(data))
+							outf.flush()
+							if not data:
+								break		
+			elif f.endswith('.xml'):
+				t.write(tabs+'- Appending: ' + f)					
+				dir=os.path.dirname(os.path.abspath(filepath))
+				xmlfile= os.path.join(dir, f)		
+				xml = open(xmlfile, 'rb')		
+				data=xml.read()
+				xml.close()				
+				outf.write(data)
+				t.update(len(data))																	
+				outf.flush()	
+				try:
+					os.remove(xmlfile) 	
+				except:
+					pass					
+		t.close()		
+		print("Closing file. Please wait")		
+		outf.close()							
 					
+				
 	def sp_groupncabyid_ND(self,buffer,ofolder,fat,fx,incxml):	
 		vfragment=False	
 		for nca in self:
@@ -4475,6 +5427,9 @@ class Nsp(Pfs0):
 							tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)
 							tit_name = (re.sub(r'[\/\\\:\*\?\!\"\<\>\|\.\s™©®()\~]+', ' ', tit_name))
 							tit_name = tit_name.strip()
+							if tit_name=='DLC' and (str(titleid2).endswith('000') or str(titleid2).endswith('800')):
+								tit_name='-'
+								editor='-'							
 							tid='['+titleid2+']'
 							tid=tid.upper()
 							filename=tit_name+' '+tid+' '+version
@@ -4730,7 +5685,7 @@ class Nsp(Pfs0):
 		return contentlist
 		
 		
-	def get_content_placeholder(self):
+	def get_content_placeholder(self,ofolder):
 		contentlist=list()
 		ncalist=list()
 		completefilelist=list()
@@ -4739,10 +5694,12 @@ class Nsp(Pfs0):
 				if 	str(file.header.contentType) != 'Content.META' and str(file.header.contentType) != 'Content.CONTROL':
 					continue
 				else:	
-					completefilelist.append(str(file._path))					
+					completefilelist.append(str(file._path))
+			elif str(file._path).endswith('.xml'):
+				pass					
 			else:
 				completefilelist.append(str(file._path))
-		#print (completefilelist)			
+		print (completefilelist)			
 		for nca in self:
 			if type(nca) == Nca:
 				if 	str(nca.header.contentType) == 'Content.META':
@@ -4814,6 +5771,30 @@ class Nsp(Pfs0):
 							nca_meta=str(nca._path)
 							if nca_meta in completefilelist:	
 								ncalist.append([nca_meta,nca.size])
+								if ofolder != False:
+									target = Fs.Nca(nca, 'r+b')
+									target.rewind()		
+									outf= os.path.join(ofolder, str(nca._path))									
+									fp = open(outf, 'w+b')		
+									for data in iter(lambda: target.read(int(32768)), ""):	
+										fp.write(data)						
+										fp.flush()				
+										if not data:
+											fp.close()									
+											break			
+									target = Fs.Nca(outf, 'r+b')										
+									block = target.read()			
+									nsha=sha256(block).hexdigest()	
+									target.rewind()	
+									xml=target.xml_gen(ofolder,nsha)									
+									xmlname=nca_meta[:-3]+'xml'
+									xmlsize=os.path.getsize(xml)
+									ncalist.append([xmlname,xmlsize])		
+									target.close()
+									try:
+										os.remove(outf) 	
+									except:
+										pass								
 							titlerights=titleid2+str('0'*15)+str(crypto2)
 							contentlist.append([str(self._path),titleid2,titlerights,keygen,ncalist,CTYPE,version])
 							
@@ -4824,15 +5805,6 @@ class Nsp(Pfs0):
 				for i in contentlist:
 					if i[2]==test:
 						i[4].append([file._path,file.size])
-			elif file._path.endswith('.xml'):	
-				test=file._path
-				#print(test)
-				test=test[:-4]+'.nca'
-				#print(test)
-				for i in contentlist:
-					for j in i[4]:
-						if j[0]==test:
-							i[4].append([file._path,file.size])
 		'''
 		for i in contentlist:
 			print('Filename: '+i[0])
@@ -4845,9 +5817,10 @@ class Nsp(Pfs0):
 				print (j)	
 		print("")
 		'''
-		return contentlist	
+
+		return contentlist				
 		
-	def append_content(self,outf,target,buffer,t,fat,fx,c,index):		
+	def append_content(self,outf,target,buffer,t,fat='exfat',fx='files',c=0,index=0):		
 		block=4294934528		
 		indent = 1
 		tabs = '\t' * indent	
@@ -4861,7 +5834,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(data))>block:	
 							n2=block-c
 							c=0										
-							dat2=data[0x00:0x00+int(n2)]										
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)									
 							fp.write(dat2)
 							fp.flush()
 							fp.close()	
@@ -4870,7 +5846,9 @@ class Nsp(Pfs0):
 							outf=outf[0:-1]
 							outf=outf+str(index)
 							fp = open(outf, 'wb')	
-							dat2=data[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
 							fp.write(dat2)						
 							t.update(len(dat2))		
 							c=c+len(dat2)													
@@ -4894,7 +5872,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(data))>block:	
 							n2=block-c
 							c=0										
-							dat2=data[0x00:0x00+int(n2)]										
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)											
 							fp.write(dat2)
 							fp.flush()
 							fp.close()	
@@ -4902,8 +5883,10 @@ class Nsp(Pfs0):
 							index=index+1
 							outf=outf[0:-1]
 							outf=outf+str(index)
-							fp = open(outf, 'wb')	
-							dat2=data[0x00+int(n2)+1:]
+							fp = open(outf, 'wb')
+							inmemoryfile.seek(n2)							
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
 							fp.write(dat2)						
 							t.update(len(dat2))		
 							c=c+len(dat2)													
@@ -4926,7 +5909,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(data))>block:	
 							n2=block-c
 							c=0										
-							dat2=data[0x00:0x00+int(n2)]										
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)										
 							fp.write(dat2)
 							fp.flush()
 							fp.close()	
@@ -4935,7 +5921,9 @@ class Nsp(Pfs0):
 							outf=outf[0:-1]
 							outf=outf+str(index)
 							fp = open(outf, 'wb')	
-							dat2=data[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
 							fp.write(dat2)						
 							t.update(len(dat2))		
 							c=c+len(dat2)													
@@ -5033,7 +6021,10 @@ class Nsp(Pfs0):
 								if fat=="fat32" and (c+len(newheader))>block:									
 									n2=block-c
 									c=0
-									dat2=newheader[0x00:0x00+int(n2)]
+									inmemoryfile = io.BytesIO()
+									inmemoryfile.write(newheader)
+									inmemoryfile.seek(0)
+									dat2=inmemoryfile.read(n2)	
 									fp.write(dat2)
 									fp.flush()
 									fp.close()	
@@ -5042,7 +6033,9 @@ class Nsp(Pfs0):
 									outf=outf[0:-1]
 									outf=outf+str(index)
 									fp = open(outf, 'wb')	
-									dat2=newheader[0x00+int(n2)+1:]
+									inmemoryfile.seek(n2)
+									dat2=inmemoryfile.read(len(newheader)-n2)
+									inmemoryfile.close()
 									fp.write(dat2)						
 									t.update(len(dat2))		
 									c=c+len(dat2)													
@@ -5060,7 +6053,10 @@ class Nsp(Pfs0):
 								if fat=="fat32" and (c+len(data))>block:	
 									n2=block-c
 									c=0										
-									dat2=data[0x00:0x00+int(n2)]										
+									inmemoryfile = io.BytesIO()
+									inmemoryfile.write(data)
+									inmemoryfile.seek(0)
+									dat2=inmemoryfile.read(n2)										
 									fp.write(dat2)
 									fp.flush()
 									fp.close()	
@@ -5069,7 +6065,9 @@ class Nsp(Pfs0):
 									outf=outf[0:-1]
 									outf=outf+str(index)
 									fp = open(outf, 'wb')	
-									dat2=data[0x00+int(n2)+1:]
+									inmemoryfile.seek(n2)
+									dat2=inmemoryfile.read(len(data)-n2)
+									inmemoryfile.close()
 									fp.write(dat2)						
 									t.update(len(dat2))		
 									c=c+len(dat2)													
@@ -5106,7 +6104,10 @@ class Nsp(Pfs0):
 								if fat=="fat32" and (c+len(newheader))>block:									
 									n2=block-c
 									c=0
-									dat2=newheader[0x00:0x00+int(n2)]
+									inmemoryfile = io.BytesIO()
+									inmemoryfile.write(newheader)
+									inmemoryfile.seek(0)
+									dat2=inmemoryfile.read(n2)	
 									fp.write(dat2)
 									fp.flush()
 									fp.close()	
@@ -5115,7 +6116,9 @@ class Nsp(Pfs0):
 									outf=outf[0:-1]
 									outf=outf+str(index)
 									fp = open(outf, 'wb')	
-									dat2=newheader[0x00+int(n2)+1:]
+									inmemoryfile.seek(n2)
+									dat2=inmemoryfile.read(len(newheader)-n2)
+									inmemoryfile.close()
 									fp.write(dat2)						
 									t.update(len(dat2))												
 									fp.flush()	
@@ -5131,7 +6134,10 @@ class Nsp(Pfs0):
 								if fat=="fat32" and (c+len(data))>block:	
 									n2=block-c
 									c=0										
-									dat2=data[0x00:0x00+int(n2)]										
+									inmemoryfile = io.BytesIO()
+									inmemoryfile.write(data)
+									inmemoryfile.seek(0)
+									dat2=inmemoryfile.read(n2)											
 									fp.write(dat2)
 									fp.flush()
 									fp.close()	
@@ -5140,7 +6146,9 @@ class Nsp(Pfs0):
 									outf=outf[0:-1]
 									outf=outf+str(index)
 									fp = open(outf, 'wb')	
-									dat2=data[0x00+int(n2)+1:]
+									inmemoryfile.seek(n2)
+									dat2=inmemoryfile.read(len(data)-n2)
+									inmemoryfile.close()
 									fp.write(dat2)						
 									t.update(len(dat2))		
 									c=c+len(dat2)													
@@ -5180,7 +6188,10 @@ class Nsp(Pfs0):
 							if fat=="fat32" and (c+len(data))>block:	
 								n2=block-c
 								c=0										
-								dat2=data[0x00:0x00+int(n2)]										
+								inmemoryfile = io.BytesIO()
+								inmemoryfile.write(data)
+								inmemoryfile.seek(0)
+								dat2=inmemoryfile.read(n2)											
 								fp.write(dat2)
 								fp.flush()
 								fp.close()	
@@ -5189,7 +6200,9 @@ class Nsp(Pfs0):
 								outf=outf[0:-1]
 								outf=outf+str(index)
 								fp = open(outf, 'wb')	
-								dat2=data[0x00+int(n2)+1:]
+								inmemoryfile.seek(n2)
+								dat2=inmemoryfile.read(len(data)-n2)
+								inmemoryfile.close()
 								fp.write(dat2)						
 								t.update(len(dat2))		
 								c=c+len(dat2)													
@@ -5222,7 +6235,10 @@ class Nsp(Pfs0):
 								if fat=="fat32" and (c+len(data))>block:	
 									n2=block-c
 									c=0										
-									dat2=data[0x00:0x00+int(n2)]										
+									inmemoryfile = io.BytesIO()
+									inmemoryfile.write(data)
+									inmemoryfile.seek(0)
+									dat2=inmemoryfile.read(n2)										
 									fp.write(dat2)
 									fp.flush()
 									fp.close()	
@@ -5231,7 +6247,9 @@ class Nsp(Pfs0):
 									outf=outf[0:-1]
 									outf=outf+str(index)
 									fp = open(outf, 'wb')	
-									dat2=data[0x00+int(n2)+1:]
+									inmemoryfile.seek(n2)
+									dat2=inmemoryfile.read(len(data)-n2)
+									inmemoryfile.close()
 									fp.write(dat2)						
 									t.update(len(dat2))		
 									c=c+len(dat2)													
@@ -5254,7 +6272,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(data))>block:	
 							n2=block-c
 							c=0										
-							dat2=data[0x00:0x00+int(n2)]										
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)										
 							fp.write(dat2)
 							fp.flush()
 							fp.close()	
@@ -5263,7 +6284,9 @@ class Nsp(Pfs0):
 							outf=outf[0:-1]
 							outf=outf+str(index)
 							fp = open(outf, 'wb')	
-							dat2=data[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
 							fp.write(dat2)						
 							t.update(len(dat2))		
 							c=c+len(dat2)													
@@ -5357,7 +6380,10 @@ class Nsp(Pfs0):
 							tit_name,editor,ediver,SupLg,regionstr,isdemo = self.inf_get_title(target,offset,content_entries,original_ID)
 							tit_name = (re.sub(r'[\/\\\:\*\?\!\"\<\>\|\.\s™©®()\~]+', ' ', tit_name))
 							tit_name = tit_name.strip()
-							filename=tit_name+' '+version+ttag
+							if tit_name=='DLC' and (str(titleid2).endswith('000') or str(titleid2).endswith('800')):
+								tit_name='-'
+								editor='-'									
+							filename=tit_name+' '+titleid3+' '+version
 							titlerights=titleid2+str('0'*15)+str(crypto2)
 							contentlist.append([filename,titleid2,titlerights,keygen,ncalist,CTYPE])
 							
@@ -5431,6 +6457,7 @@ class Nsp(Pfs0):
 			splitnumb=math.ceil(totSize/4294901760)
 			index=0
 			filepath=filepath[:-1]+str(index)
+			
 		if fx=="folder" and fat=="fat32":
 			output_folder ="archfolder" 
 			output_folder = os.path.join(ofolder, output_folder)			
@@ -5445,6 +6472,7 @@ class Nsp(Pfs0):
 		t = tqdm(total=totSize, unit='B', unit_scale=True, leave=False)		
 		t.write(tabs+'- Writing header...')	
 		outf = open(str(filepath), 'w+b')	
+		outfile=str(filepath)
 		outf.write(hd)			
 		t.update(len(hd))
 		c=c+len(hd)		
@@ -5471,7 +6499,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(newheader))>block:
 							n2=block-c
 							c=0
-							dat2=newheader[0x00:0x00+int(n2)]
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(newheader)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)	
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -5480,7 +6511,9 @@ class Nsp(Pfs0):
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
 							outf = open(outfile, 'wb')	
-							dat2=newheader[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(newheader)-n2)
+							inmemoryfile.close()
 							outf.write(dat2)						
 							t.update(len(dat2))									
 							outf.flush()	
@@ -5491,14 +6524,13 @@ class Nsp(Pfs0):
 						file.seek(0xC00)									
 						i+=1							
 					else:
-						outf.write(data)				
-						t.update(len(data))
-						c=c+len(data)									
-						outf.flush()
 						if fat=="fat32" and (c+len(data))>block:
 							n2=block-c
 							c=0
-							dat2=file.read(int(n2))
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -5506,21 +6538,31 @@ class Nsp(Pfs0):
 							index=index+1
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
-							outf = open(outfile, 'wb')							
+							outf = open(outfile, 'wb')
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
+							outf.write(dat2)						
+							t.update(len(dat2))									
+							outf.flush()
+						else:	
+							outf.write(data)				
+							t.update(len(data))
+							c=c+len(data)									
+							outf.flush()							
 						if not data:
 							break				
 			if type(file) != Nca and file._path in contentlist:
 				file.rewind()			
 				t.write(tabs+'- Appending: ' + str(file._path))					
 				for data in iter(lambda: file.read(int(buffer)), ""):				
-					outf.write(data)
-					t.update(len(data))
-					c=c+len(data)
-					outf.flush()
 					if fat=="fat32" and (c+len(data))>block:
 						n2=block-c
 						c=0
-						dat2=file.read(int(n2))
+						inmemoryfile = io.BytesIO()
+						inmemoryfile.write(data)
+						inmemoryfile.seek(0)
+						dat2=inmemoryfile.read(n2)		
 						outf.write(dat2)
 						outf.flush()
 						outf.close()	
@@ -5529,11 +6571,17 @@ class Nsp(Pfs0):
 						outfile=outfile[0:-1]
 						outfile=outfile+str(index)
 						outf = open(outfile, 'wb')
-						if totSize>(4294934528+int(buffer)):
-							dat2=file.read(int(buffer))
-							outf.write(dat2)						
-							t.update(len(dat2))									
-							outf.flush()	
+						inmemoryfile.seek(n2)
+						dat2=inmemoryfile.read(len(data)-n2)
+						inmemoryfile.close()
+						outf.write(dat2)						
+						t.update(len(dat2))									
+						outf.flush()
+					else:	
+						outf.write(data)				
+						t.update(len(data))
+						c=c+len(data)									
+						outf.flush()							
 					if not data:
 						break							
 		t.close()		
@@ -5647,10 +6695,14 @@ class Nsp(Pfs0):
 			Print.info('masterKeyRev =\t' + hex(masterKeyRev))									
 		print("")		
 		
+		if totSize <= 4294934528:
+			fat="exfat"
 		if fat=="fat32":
 			splitnumb=math.ceil(totSize/4294934528)
 			index=0
 			filepath=filepath[:-1]+str(index)
+			
+		outfile=str(filepath)	
 		c=0
 		t = tqdm(total=totSize, unit='B', unit_scale=True, leave=False)
 		t.write(tabs+'- Writing XCI header...')
@@ -5731,7 +6783,10 @@ class Nsp(Pfs0):
 						if fat=="fat32" and (c+len(newheader))>block:
 							n2=block-c
 							c=0
-							dat2=newheader[0x00:0x00+int(n2)]
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(newheader)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)	
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -5740,7 +6795,9 @@ class Nsp(Pfs0):
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
 							outf = open(outfile, 'wb')	
-							dat2=newheader[0x00+int(n2)+1:]
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(newheader)-n2)
+							inmemoryfile.close()
 							outf.write(dat2)						
 							t.update(len(dat2))									
 							outf.flush()	
@@ -5751,14 +6808,13 @@ class Nsp(Pfs0):
 						nca.seek(0xC00)									
 						i+=1		
 					else:			
-						outf.write(data)
-						t.update(len(data))
-						c=c+len(data)
-						outf.flush()
 						if fat=="fat32" and (c+len(data))>block:
 							n2=block-c
 							c=0
-							dat2=nca.read(int(n2))
+							inmemoryfile = io.BytesIO()
+							inmemoryfile.write(data)
+							inmemoryfile.seek(0)
+							dat2=inmemoryfile.read(n2)
 							outf.write(dat2)
 							outf.flush()
 							outf.close()	
@@ -5767,11 +6823,17 @@ class Nsp(Pfs0):
 							outfile=outfile[0:-1]
 							outfile=outfile+str(index)
 							outf = open(outfile, 'wb')
-							if totSize>(4294934528+int(buffer)):
-								dat2=nca.read(int(buffer))
-								outf.write(dat2)						
-								t.update(len(dat2))									
-								outf.flush()	
+							inmemoryfile.seek(n2)
+							dat2=inmemoryfile.read(len(data)-n2)
+							inmemoryfile.close()
+							outf.write(dat2)						
+							t.update(len(dat2))									
+							outf.flush()
+						else:		
+							outf.write(data)
+							t.update(len(data))
+							c=c+len(data)
+							outf.flush()								
 						if not data:
 							break
 		t.close()
@@ -5967,4 +7029,658 @@ class Nsp(Pfs0):
 							gamecard=True				
 		return sha,sizef,gamecard
 		
+	def verify(self):		
+		contentlist=list()
+		validfiles=list()
+		listed_files=list()		
+		contentlist=list()
+		feed=''
+		delta = False
+		verdict = True		
+		checktik=False		
+		message='***************';print(message);feed+=message+'\n'
+		message='DECRIPTION TEST';print(message);feed+=message+'\n'
+		message='***************';print(message);feed+=message+'\n'	
+		for file in self:
+			if str(file._path).endswith('.nca'):		
+				listed_files.append(str(file._path))
+			if type(file) == Nca:
+				validfiles.append(str(file._path))				
+		for file in self:
+			if str(file._path).endswith('.tik'):		
+				listed_files.append(str(file._path))
+			if type(file) == Ticket:
+				validfiles.append(str(file._path))						
+				
+		for file in listed_files:	
+			correct=False;baddec=False			
+			if file in validfiles:
+				if file.endswith('cnmt.nca'):
+					for f in self:	
+						if str(f._path) == file:
+							message=(str(f.header.titleId)+' - '+str(f.header.contentType));print(message);feed+=message+'\n'																
+							for nf in f:	
+								nf.rewind()
+								test=nf.read(0x4)	
+								#print(test)														
+								if str(test) == "b'PFS0'":
+									correct=True
+									break	
+							if correct == True:
+								correct = self.verify_enforcer(file)
+				elif file.endswith('.nca'):
+					for f in self:	
+						if str(f._path) == file:
+							message=(str(f.header.titleId)+' - '+str(f.header.contentType));print(message);feed+=message+'\n'								
+							if str(f.header.contentType) != 'Content.PROGRAM':	
+								correct = self.verify_enforcer(file)
+								if correct == True:
+									if str(f.header.contentType) == 'Content.PUBLIC_DATA' and f.header.getRightsId() == 0:
+										correct = f.pr_noenc_check_dlc()				
+										if correct == False:
+											baddec=True											
+							else:
+								for nf in f:
+									nf.rewind()		
+									test=nf.read(0x4)
+									#print(test)												
+									if str(test) == "b'PFS0'":
+										correct=True
+										break	
+									f.rewind()														
+								if correct == True:
+									correct = self.verify_enforcer(file)
+								if correct == False and f.header.getRightsId() == 0:
+									correct = f.pr_noenc_check()		
+								if correct == False and f.header.getRightsId() != 0:
+									correct,tk = self.verify_nca_key(file)											
+								if correct == True and f.header.getRightsId() == 0:
+									correct = f.pr_noenc_check()				
+									if correct == False:
+										baddec=True									
+				elif file.endswith('.tik'):	
+					tikfile=str(file)				
+					checktik == False
+					for f in self:	
+						if str(f._path).endswith('.nca'):									
+							if checktik == False and f.header.getRightsId() != 0:
+								checktik = self.verify_key(str(f._path),tikfile)	
+								if 	checktik == True:
+									break								
+					message=('Content.TICKET');print(message);feed+=message+'\n'												
+					correct = checktik				
+				else:
+					correct=False	
+			if correct==True:
+				if file.endswith('cnmt.nca'):				
+					message=(tabs+file+' -> is CORRECT');print(message);feed+=message+'\n'					
+				else:
+					message=(tabs+file+tabs+'  -> is CORRECT');print(message);feed+=message+'\n'									
+			else:
+				verdict=False			
+				if file.endswith('cnmt.nca'):	
+					message=(tabs+file+' -> is CORRUPT <<<-');print(message);feed+=message+'\n'					
+				elif file.endswith('nca'):		
+					message=(tabs+file+tabs+'  -> is CORRUPT <<<-');print(message);feed+=message+'\n'					
+					if baddec == True:
+						print(tabs+'  * NOTE: S.C. CONVERSION WAS PERFORMED WITH BAD KEY')					
+				elif file.endswith('tik'):		
+					message=(tabs+file+tabs+'  -> titlekey is INCORRECT <<<-');print(message);feed+=message+'\n'					
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.META':		
+					for f in nca:
+						for cnmt in f:	
+							nca.rewind()
+							cnmt.rewind()						
+							titleid=cnmt.readInt64()
+							titleversion = cnmt.read(0x4)
+							cnmt.rewind()
+							cnmt.seek(0xE)
+							offset=cnmt.readInt16()
+							content_entries=cnmt.readInt16()
+							meta_entries=cnmt.readInt16()
+							content_type=str(cnmt._path)
+							content_type=content_type[:-22]	
+							titleid2 = str(hx(titleid.to_bytes(8, byteorder='big'))) 	
+							titleid2 = titleid2[2:-1]	
+							cnmt.seek(0x20)
+							if content_type=='Application':
+								original_ID=titleid2
+								cnmt.readInt64()
+								ttag=''
+								CTYPE='BASE'
+							elif content_type=='Patch':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								ttag=' [UPD]'
+								CTYPE='UPDATE'
+							elif content_type=='AddOnContent':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								ttag=' [DLC]'
+								CTYPE='DLC'								
+							else: 
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]							
+							cnmt.seek(0x20+offset)			
+							for i in range(content_entries):
+								vhash = cnmt.read(0x20)
+								NcaId = cnmt.read(0x10)
+								size = cnmt.read(0x6)
+								size=int.from_bytes(size, byteorder='little')
+								ncatype = cnmt.readInt8()
+								unknown = cnmt.read(0x1)		
+							#**************************************************************	
+								version=str(int.from_bytes(titleversion, byteorder='little'))
+								ver=version
+								ver='[v'+ver+']'
+								titleid3 ='['+ titleid2+']'
+								nca_name=str(hx(NcaId))
+								nca_name=nca_name[2:-1]+'.nca'
+								if (nca_name not in listed_files and ncatype!=6) or (nca_name not in validfiles and ncatype!=6):
+									verdict = False
+									message=('\n- Missing file from '+titleid2+': '+nca_name);print(message);feed+=message+'\n'
+
+		ticketlist=list()
+		for ticket in self:
+			if type(ticket) == Ticket:		
+				ticketlist.append(str(ticket._path))
+		titlerights=list()							
+		for nca in self:
+			if type(nca) == Nca:
+				if nca.header.getRightsId() != 0:		
+					rightsId = hx(nca.header.getRightsId().to_bytes(0x10, byteorder='big')).decode('utf-8').lower()
+					if rightsId not in titlerights:
+						titlerights.append(rightsId)
+						mtick=rightsId+'.tik'
+						if mtick not in ticketlist:			
+							message=('\n- File has titlerights!!! Missing ticket: '+mtick);print(message);feed+=message+'\n'
+							verdict = False
+									
+		if verdict == False:
+			message='\nVERDICT: NSP FILE IS CORRUPT OR MISSES FILES\n';print(message);feed+=message+'\n'				
+		if verdict == True:	
+			message='\nVERDICT: NSP FILE IS CORRECT\n';print(message);feed+=message
+		return verdict,feed			
+			
+	def verify_sig(self,feed,tmpfolder):	
+		hlisthash=False
+		if feed == False:
+			feed=''	
+		verdict=True	
+		headerlist=list()
+		keygenerationlist=list()
+		message='****************';print(message);feed+='\n'+message+'\n'
+		message='SIGNATURE 1 TEST';print(message);feed+=message+'\n'
+		message='****************';print(message);feed+=message+'\n'									
+		for f in self:			
+			if type(f) == Nca and f.header.contentType != Type.Content.META:
+				message=(str(f.header.titleId)+' - '+str(f.header.contentType));print(message);feed+=message+'\n'											
+				verify,origheader,ncaname,feed,origkg,tr,tkey,iGC=f.verify(feed)		
+				headerlist.append([ncaname,origheader,hlisthash])		
+				keygenerationlist.append([ncaname,origkg])
+				if verdict == True:
+					verdict=verify
+				message='';print(message);feed+=message+'\n'	
+		for f in self:	
+			if type(f) == Nca and f.header.contentType == Type.Content.META:
+				meta_nca=f._path
+				f.rewind();meta_dat=f.read()
+				message=(str(f.header.titleId)+' - '+str(f.header.contentType));print(message);feed+=message+'\n'	
+				targetkg,minrsv=self.find_addecuatekg(meta_nca,keygenerationlist)
+				verify,origheader,ncaname,feed,origkg,tr,tkey,iGC=f.verify(feed)
+				#print(targetkg)				
+				if verify == False:
+					tempfile=os.path.join(tmpfolder,meta_nca)
+					if not os.path.exists(tmpfolder):
+						os.makedirs(tmpfolder)	
+					fp = open(tempfile, 'w+b')
+					fp.write(meta_dat);fp.flush();fp.close()
+					kglist=sq_tools.kgstring()
+					numb=0;topkg=len(kglist)
+					for kg in kglist:
+						topkg-=1
+						if topkg >= origkg:	
+							for verNumber in kg:
+								numb+=1
+					cnmtdidverify=False			
+					t = tqdm(total=numb, unit='RSV', unit_scale=True, leave=False)
+					topkg=len(kglist)					
+					for kg in kglist:
+						if cnmtdidverify == True:
+							break
+						topkg-=1
+						#print(topkg)
+						if topkg >= origkg:
+							c=0;rsv_endcheck=False
+							for verNumber in kg:
+								c+=1
+								if topkg == origkg:
+									if c == len(kg):
+										rsv_endcheck=True
+								#print(verNumber)
+								fp = Fs.Nca(tempfile, 'r+b')
+								fp.write_req_system(verNumber)
+								fp.flush()
+								fp.close()
+								############################
+								fp = Fs.Nca(tempfile, 'r+b')
+								sha=fp.calc_pfs0_hash()
+								fp.flush()
+								fp.close()
+								fp = Fs.Nca(tempfile, 'r+b')
+								fp.set_pfs0_hash(sha)
+								fp.flush()
+								fp.close()
+								############################
+								fp = Fs.Nca(tempfile, 'r+b')
+								sha2=fp.calc_htable_hash()
+								fp.flush()
+								fp.close()						
+								fp = Fs.Nca(tempfile, 'r+b')
+								fp.header.set_htable_hash(sha2)
+								fp.flush()
+								fp.close()
+								########################
+								fp = Fs.Nca(tempfile, 'r+b')
+								sha3=fp.header.calculate_hblock_hash()
+								fp.flush()
+								fp.close()						
+								fp = Fs.Nca(tempfile, 'r+b')
+								fp.header.set_hblock_hash(sha3)
+								fp.flush()
+								fp.close()	
+								fp = Fs.Nca(tempfile, 'r+b')
+								progress=True
+								verify,origheader,ncapath,feed,origkg,tr,tkey,iGC=fp.verify(feed,targetkg,rsv_endcheck,progress,t)	
+								fp.close()
+								t.update(1)	
+								if verify == True:
+									t.close()	
+									message=(tabs+'* '+"RSV WAS CHANGED FROM "+str(verNumber)+" TO "+str(minrsv));print(message);feed+=message+'\n'	
+									message=(tabs+'* '+"THE CNMT FILE IS CORRECT");print(message);feed+=message+'\n'										
+									if origheader != False:	
+										hlisthash=True;i=0
+										fp = Fs.Nca(tempfile, 'r+b')
+										for data in iter(lambda: fp.read(int(32768)), ""):											
+											if i==0:
+												sha0=sha256()
+												sha0.update(origheader)	
+												i+=1
+												fp.flush()												
+												fp.seek(0xC00)
+											else:		
+												sha0.update(data)								
+												fp.flush()
+												if not data:
+													fp.close()												
+													cnmtdidverify=True
+													break	
+									break
+						else:break
+				try:
+					t.close()
+				except:pass
+				if hlisthash == True:
+					sha0=sha0.hexdigest()
+					hlisthash=sha0
+				headerlist.append([ncaname,origheader,hlisthash,tr,tkey,iGC])	
+				message='';print(message);feed+=message+'\n'		
+		try:
+			shutil.rmtree(tmpfolder)
+		except:pass						
+		if verdict == False:
+			message=("VERDICT: NSP FILE COULD'VE BEEN TAMPERED WITH");print(message);feed+=message+'\n'												
+		if verdict == True:	
+			message=('VERDICT: NSP FILE IS SAFE');print(message);feed+=message+'\n'				
+		return 	verdict,headerlist,feed			
+
+	def find_addecuatekg(self,ncameta,keygenerationlist):
+		ncalist=list()
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.META':	
+					if nca._path == ncameta:
+						for f in nca:
+							for cnmt in f:	
+								nca.rewind()
+								cnmt.rewind()						
+								titleid=cnmt.readInt64()
+								titleversion = cnmt.read(0x4)					
+								cnmt.rewind()
+								cnmt.seek(0xE)
+								offset=cnmt.readInt16()
+								content_entries=cnmt.readInt16()
+								cnmt.seek(0x20)
+								original_ID=cnmt.readInt64()								
+								min_sversion=cnmt.readInt32()								
+								cnmt.seek(0x20+offset)			
+								for i in range(content_entries):
+									vhash = cnmt.read(0x20)
+									NcaId = cnmt.read(0x10)
+									ncaname=(str(hx(NcaId)))[2:-1]+'.nca'
+									for i in range(len(keygenerationlist)):
+										if ncaname == keygenerationlist[i][0]:
+											if keygenerationlist[i][1] != False:
+												return keygenerationlist[i][1],min_sversion
+									else:
+										size = cnmt.read(0x6)
+										size=int.from_bytes(size, byteorder='little')
+										ncatype = cnmt.readInt8()
+										unknown = cnmt.read(0x1)
+		for nca in self:
+			if type(nca) == Nca:
+				if 	str(nca.header.contentType) == 'Content.META':	
+					if nca._path == ncameta:										
+						crypto1=nca.header.getCryptoType()
+						crypto2=nca.header.getCryptoType2()			
+						if crypto2>crypto1:
+							keygeneration=crypto2
+						if crypto2<=crypto1:	
+							keygeneration=crypto1	
+						return keygeneration,min_sversion	
+		return False,False		
+
+
+	def verify_hash_nca(self,buffer,headerlist,didverify,feed):	
+		verdict=True		
+		if feed == False:
+			feed=''				
+		message='\n***************';print(message);feed+=message+'\n'
+		message=('HASH TEST');print(message);feed+=message+'\n'
+		message='***************';print(message);feed+=message+'\n'			
+		for f in self:						
+			if type(f) == Nca:
+				origheader=False
+				for i in range(len(headerlist)):
+					if str(f._path)==headerlist[i][0]:
+						origheader=headerlist[i][1]
+						listedhash=headerlist[i][2]
+						break			
+				message=(str(f.header.titleId)+' - '+str(f.header.contentType));print(message);feed+=message+'\n'
+				ncasize=f.header.size						
+				t = tqdm(total=ncasize, unit='B', unit_scale=True, leave=False)	
+				i=0		
+				f.rewind();
+				rawheader=f.read(0xC00)
+				f.rewind()												
+				for data in iter(lambda: f.read(int(buffer)), ""):				
+					if i==0:	
+						sha=sha256()
+						f.seek(0xC00)
+						sha.update(rawheader)
+						if origheader != False and listedhash == False:
+							sha0=sha256()
+							sha0.update(origheader)	
+						i+=1
+						t.update(len(data))
+						f.flush()
+					else:		
+						sha.update(data)
+						if origheader != False and listedhash == False:
+							sha0.update(data)								
+						t.update(len(data))
+						f.flush()
+						if not data:				
+							break						
+				t.close()	
+				sha=sha.hexdigest()	
+				if listedhash != False:
+					sha0=listedhash
+				elif origheader != False:
+					sha0=sha0.hexdigest()						
+				message=('  - File name: '+f._path);print(message);feed+=message+'\n'
+				message=('  - SHA256: '+sha);print(message);feed+=message+'\n'
+				if origheader != False:
+					message=('  - ORIG_SHA256: '+sha0);print(message);feed+=message+'\n'						
+				if str(f._path)[:16] == str(sha)[:16]:
+					message=('   > FILE IS CORRECT');print(message);feed+=message+'\n'
+				elif origheader != False:
+					if str(f._path)[:16] == str(sha0)[:16]:		
+						message=('   > FILE IS CORRECT');print(message);feed+=message+'\n'
+					else:
+						message=('   > FILE IS CORRUPT');print(message);feed+=message+'\n'
+						verdict = False	
+				elif  f.header.contentType == Type.Content.META and didverify == True:		
+					message=('   > RSV WAS CHANGED');print(message);feed+=message+'\n'
+					#print('   > CHECKING INTERNAL HASHES')								
+					message=('     * FILE IS CORRECT');print(message);feed+=message+'\n'							
+				else:
+					message=('   > FILE IS CORRUPT');print(message);feed+=message+'\n'
+					verdict = False
+				message=('');print(message);feed+=message+'\n'			
+		if verdict == False:
+			message=("VERDICT: NSP FILE IS CORRUPT");print(message);feed+=message+'\n'
+		if verdict == True:	
+			message=('VERDICT: NSP FILE IS CORRECT');print(message);feed+=message+'\n'
+		return 	verdict,feed			
+									
+	def verify_enforcer(self,nca):
+
+		for f in self:
+			if str(f._path) == nca:
+				if type(f) == Fs.Nca and f.header.contentType == Type.Content.PROGRAM:
+					for fs in f.sectionFilesystems:
+						if fs.fsType == Type.Fs.PFS0 and fs.cryptoType == Type.Crypto.CTR:
+							f.seek(0)
+							ncaHeader = f.read(0x400)
+
+							sectionHeaderBlock = fs.buffer
+
+							f.seek(fs.offset)
+							pfs0Header = f.read(0x10)
+							return True
+						else:
+							return False			
+				if type(f) == Fs.Nca and f.header.contentType == Type.Content.META:
+					for fs in f.sectionFilesystems:
+						if fs.fsType == Type.Fs.PFS0 and fs.cryptoType == Type.Crypto.CTR:
+							f.seek(0)
+							ncaHeader = f.read(0x400)
+
+							sectionHeaderBlock = fs.buffer
+
+							f.seek(fs.offset)
+							pfs0Header = f.read(0x10)
+							return True
+						else:
+							return False								
+							
+				if type(f) == Fs.Nca:
+					for fs in f.sectionFilesystems:
+						if fs.fsType == Type.Fs.ROMFS and fs.cryptoType == Type.Crypto.CTR or f.header.contentType == Type.Content.MANUAL or f.header.contentType == Type.Content.DATA:
+							f.seek(0)
+							ncaHeader = f.read(0x400)
+
+							sectionHeaderBlock = fs.buffer
+
+							levelOffset = int.from_bytes(sectionHeaderBlock[0x18:0x20], byteorder='little', signed=False)
+							levelSize = int.from_bytes(sectionHeaderBlock[0x20:0x28], byteorder='little', signed=False)
+
+							offset = fs.offset + levelOffset
+
+							f.seek(offset)
+							pfs0Header = f.read(levelSize)
+							return True
+						else:
+							return False		
+
+	def verify_nca_key(self,nca):
+		check=False;titleKey=0
+		for file in self:	
+			if (file._path).endswith('.tik'):
+				titleKey = file.getTitleKeyBlock().to_bytes(16, byteorder='big')
+				check=self.verify_key(nca,str(file._path))
+				if check==True:
+					break
+		return check,titleKey								
+							
+	def verify_key(self,nca,ticket):
+		for file in self:
+			if type(file) == Nca:
+				crypto1=file.header.getCryptoType()	
+				crypto2=file.header.getCryptoType2()					
+				if crypto1 == 2:
+					if crypto1 > crypto2:								
+						masterKeyRev=file.header.getCryptoType()
+					else:			
+						masterKeyRev=file.header.getCryptoType2()	
+				else:			
+					masterKeyRev=file.header.getCryptoType2()	
+				if str(file._path) == nca:						
+					break			
+
+		for file in self:
+			if type(file) == Ticket:
+				if ticket != False:
+					if str(file._path) == ticket:
+						titleKeyDec = Keys.decryptTitleKey(file.getTitleKeyBlock().to_bytes(16, byteorder='big'), Keys.getMasterKeyIndex(masterKeyRev))
+						rightsId = file.getRightsId()
+						break
+				else:
+					ticket = str(file._path)
+					titleKeyDec = Keys.decryptTitleKey(file.getTitleKeyBlock().to_bytes(16, byteorder='big'), Keys.getMasterKeyIndex(masterKeyRev))
+					rightsId = file.getRightsId()									
+									
+		decKey = titleKeyDec
 		
+		for f in self:
+			if str(f._path) == nca:
+				if type(f) == Fs.Nca and f.header.getRightsId() != 0:
+					for fs in f.sectionFilesystems:
+						#print(fs.fsType)
+						#print(fs.cryptoType)
+						if fs.fsType == Type.Fs.PFS0 and fs.cryptoType == Type.Crypto.CTR:
+							f.seek(0)
+							ncaHeader = NcaHeader()
+							ncaHeader.open(MemoryFile(f.read(0x400), Type.Crypto.XTS, uhx(Keys.get('header_key'))))							
+							pfs0=fs
+							sectionHeaderBlock = fs.buffer
+							f.seek(fs.offset)
+							pfs0Offset=fs.offset
+							pfs0Header = f.read(0x10)	
+							#print(sectionHeaderBlock[8:12] == b'IVFC')	
+							if sectionHeaderBlock[8:12] == b'IVFC':	
+								#Hex.dump(self.sectionHeaderBlock)
+								#Print.info(hx(self.sectionHeaderBlock[0xc8:0xc8+0x20]).decode('utf-8'))
+								mem = MemoryFile(pfs0Header, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = pfs0Offset)
+								data = mem.read();
+								#Hex.dump(data)
+								#print('hash = %s' % str(sha256(data).hexdigest()))
+								if hx(sectionHeaderBlock[0xc8:0xc8+0x20]).decode('utf-8') == str(sha256(data).hexdigest()):
+									return True
+								else:
+									return False
+							else:
+								mem = MemoryFile(pfs0Header, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = pfs0Offset)
+								data = mem.read();
+								#Hex.dump(data)								
+								magic = mem.read()[0:4]
+								#print(magic)
+								if magic != b'PFS0':
+									return False
+								else:	
+									return True			
+						
+						if fs.fsType == Type.Fs.ROMFS and fs.cryptoType == Type.Crypto.CTR:	
+							f.seek(0)
+							ncaHeader = NcaHeader()
+							ncaHeader.open(MemoryFile(f.read(0x400), Type.Crypto.XTS, uhx(Keys.get('header_key'))))	
+							ncaHeader = f.read(0x400)
+							pfs0=fs
+							sectionHeaderBlock = fs.buffer
+
+							levelOffset = int.from_bytes(sectionHeaderBlock[0x18:0x20], byteorder='little', signed=False)
+							levelSize = int.from_bytes(sectionHeaderBlock[0x20:0x28], byteorder='little', signed=False)
+
+							pfs0Offset = fs.offset + levelOffset
+							f.seek(pfs0Offset)
+							pfs0Header = f.read(levelSize)
+							#print(sectionHeaderBlock[8:12] == b'IVFC')	
+							if sectionHeaderBlock[8:12] == b'IVFC':	
+								#Hex.dump(self.sectionHeaderBlock)
+								#Print.info(hx(self.sectionHeaderBlock[0xc8:0xc8+0x20]).decode('utf-8'))
+								mem = MemoryFile(pfs0Header, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = pfs0Offset)
+								data = mem.read();
+								#Hex.dump(data)
+								#print('hash = %s' % str(sha256(data).hexdigest()))
+								if hx(sectionHeaderBlock[0xc8:0xc8+0x20]).decode('utf-8') == str(sha256(data).hexdigest()):
+									return True
+								else:
+									return False
+							else:
+								mem = MemoryFile(pfs0Header, Type.Crypto.CTR, decKey, pfs0.cryptoCounter, offset = pfs0Offset)
+								data = mem.read();
+								#Hex.dump(data)								
+								magic = mem.read()[0:4]
+								#print(magic)
+								if magic != b'PFS0':
+									return False
+								else:	
+									return True	
+							
+	def cnmt_get_baseids(self):			
+		ctype='addon'
+		idlist=list()
+		counter=0		
+		for nca in self:					
+			if type(nca) == Nca:				
+				if 	str(nca.header.contentType) == 'Content.META':
+					for pfs0 in nca:
+						for cnmt in pfs0:
+							cnmt.rewind()							
+							titleid=cnmt.readInt64()
+							titleid2 = str(hx(titleid.to_bytes(8, byteorder='big'))) 	
+							titleid2 = titleid2[2:-1]	
+							if counter>0 and not str(titleid2).endswith('000'):
+								counter+=1
+								break		
+							else:	
+								counter+=1									
+							titleversion = cnmt.read(0x4);cnmt.seek(0xE)
+							offset=cnmt.readInt16();content_entries=cnmt.readInt16()
+							meta_entries=cnmt.readInt16();content_type=str(cnmt._path);content_type=content_type[:-22]						
+							cnmt.seek(0x20)				
+							if content_type=='Application':
+								original_ID=titleid2
+								if original_ID not in idlist:
+									idlist.append(original_ID)
+								ctype='base'
+							elif content_type=='Patch':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								if original_ID not in idlist:
+									idlist.append(original_ID)
+								ctype='update'		
+							elif content_type=='AddOnContent':
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]	
+								if original_ID not in idlist:
+									idlist.append(original_ID)	
+								ctype='addon'		
+							else: 
+								original_ID=cnmt.readInt64()	
+								original_ID=str(hx(original_ID.to_bytes(8, byteorder='big')))
+								original_ID = original_ID[2:-1]		
+								if original_ID not in idlist:
+									idlist.append(original_ID)	
+								ctype='addon'			
+							break				
+						
+		'''								
+		for i in idlist:
+			print(i)
+		'''	
+		return ctype,idlist	
+		
+##################		
+#FILE RESTORATION
+##################
+
+					

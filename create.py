@@ -133,7 +133,7 @@ def create_xci(title_id, paths):
                                 f'-tfile "{root / "multi.txt"}" '
                                 f'-t xci',
                                 shell=True, stdout=subprocess.PIPE).stdout.read()
-    nscb_xci = output / f'file[nscb].xci'
+    nscb_xci = output / f'file.xci'
 
     if b"Exception" in squirrel:
         nscb_xci.unlink()
@@ -145,6 +145,10 @@ def create_xci(title_id, paths):
         custom_xci = output / f'{name}.xci'
         try:
             nscb_xci.replace(custom_xci)
+            squirrel2 = subprocess.Popen(f'{py_command} "{root / "ztools/squirrel.py"}" '
+                                         f'-snz "{custom_xci}" '
+                                         f'-t xci',
+                                         shell=True, stdout=subprocess.PIPE).stdout.read()
             print(f'Created {custom_xci}')
             print(f'This has the following files in it:\n{string}')
             passed = True
